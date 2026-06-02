@@ -77,4 +77,48 @@ async function getHearing(req, res) {
   }
 }
 
-module.exports = { listHearings, getHearing };
+async function getHearingTranscript(req, res) {
+  try {
+    const { rows: hearingRows } = await db.query(`
+      SELECT h.*, c.name AS committee_name, c.chamber AS committee_chamber
+      FROM hearings h
+      LEFT JOIN committees c ON c.id = h.committee_id
+      WHERE h.id = $1
+    `, [req.params.id]);
+
+    if (!hearingRows.length) return res.status(404).json({ error: 'Hearing not found' });
+
+    const { rows: txRows } = await db.query(`
+      SELECT * FROM transcripts
+      WHERE hearing_id = $1
+      ORDER BY is_primary DESC, created_at DESC
+      LIMIT 1
+    `, [req.params.id]);
+
+    if (!txRows.length) {
+      return res.json({ data: { hearing: hearingRows[0], transcript: null } });
+    }
+
+    const transcript = txRows[0];
+
+    const { rows: turns } = await db.query(`
+      SELECT
+        st.id, st.seq, st.member_id, st.speaker_name, st.speaker_role,
+        st.start_ms, st.end_ms, st.attribution_status,
+        st.raw_text, st.clean_text, st.word_times, st.is_edited,
+        m.full_name AS member_full_name, m.bioguide_id,
+        m.party, m.state, m.chamber
+      FROM speaker_turns st
+      LEFT JOIN members m ON m.id = st.member_id
+      WHERE st.transcript_id = $1
+      ORDER BY st.seq
+    `, [transcript.id]);
+
+    res.json({ data: { hearing: hearingRows[0], transcript: { ...transcript, turns } } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+module.exports = { listHearings, getHearing, getHearingTranscript };
