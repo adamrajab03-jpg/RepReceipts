@@ -1,6 +1,7 @@
 import { Link, useParams } from 'react-router-dom'
 import { useHearingTranscript } from '../hooks/useHearingTranscript'
 import TranscriptView from '../components/TranscriptView'
+import CommentThread from '../components/CommentThread'
 import { cn } from '../utils/cn'
 
 const STATUS_STYLES: Record<string, string> = {
@@ -69,6 +70,17 @@ export default function HearingTranscriptPage() {
           <TranscriptView transcript={transcript} />
         </>
       )}
+
+      {/* Hearing-level discussion — not tied to any specific turn */}
+      <div className="mt-8">
+        <h2 className="text-lg font-semibold text-gray-800 mb-3">Discussion</h2>
+        <div className="bg-white rounded-lg border border-gray-200 p-5">
+          <CommentThread
+            scope={{ type: 'hearing', id: id! }}
+            defaultCollapsed={false}
+          />
+        </div>
+      </div>
     </div>
   )
 }

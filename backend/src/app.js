@@ -2,9 +2,11 @@ const express     = require('express');
 const cookieParser = require('cookie-parser');
 const { doubleCsrf } = require('csrf-csrf');
 
-const membersRouter = require('./routes/members');
+const membersRouter  = require('./routes/members');
 const hearingsRouter = require('./routes/hearings');
-const authRouter    = require('./routes/auth');
+const authRouter     = require('./routes/auth');
+const turnsRouter    = require('./routes/turns');
+const commentsRouter = require('./routes/comments');
 
 // ── CSRF (double-submit signed cookie, SameSite=Strict is primary defence) ───
 const {
@@ -46,6 +48,8 @@ app.get('/api/auth/csrf', (req, res) => {
 app.use('/api/auth',     authRouter);
 app.use('/api/members',  membersRouter);
 app.use('/api/hearings', hearingsRouter);
+app.use('/api/turns',    turnsRouter);
+app.use('/api/comments', commentsRouter);
 
 // ── Error handler ─────────────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars

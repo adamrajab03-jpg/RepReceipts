@@ -80,6 +80,32 @@ export interface HearingTranscript {
   transcript: Transcript | null
 }
 
+// ── Comments ──────────────────────────────────────────────────────────────────
+export interface Comment {
+  id: string
+  parent_id: string | null
+  turn_id: string | null
+  hearing_id: string | null
+  body: string
+  score: number
+  is_deleted: boolean
+  created_at: string
+  author_handle: string | null
+  // quote fields (null when no quote)
+  char_start: number | null
+  char_end: number | null
+  quoted_text: string | null
+  user_vote: -1 | 1 | null
+}
+
+export type CommentNode = Comment & { children: CommentNode[] }
+
+export interface VoteResult {
+  comment_id: string
+  score: number
+  user_vote: -1 | 1 | null
+}
+
 export interface ListResponse<T> {
   data: T[]
   count: number
