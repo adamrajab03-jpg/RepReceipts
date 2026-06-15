@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { type CommentNode, type WordTime } from '../types/api'
-import { type CommentScope, useVoteComment } from '../hooks/useComments'
+import { type CommentScope, useVoteComment, useDeleteComment } from '../hooks/useComments'
 import { useAuthStore } from '../store/authStore'
 import { resolveToMs, msToTimestamp } from '../utils/resolveMs'
 import CommentForm from './CommentForm'
@@ -35,7 +35,15 @@ function timeAgo(iso: string): string {
 export default function CommentItem({ comment: c, scope, depth, turnRef }: CommentItemProps) {
   const user     = useAuthStore(s => s.user)
   const vote     = useVoteComment()
+  const del      = useDeleteComment()
   const [replying, setReplying] = useState(false)
+
+  const canDelete = !!user && !c.is_deleted && (user.id === c.user_id || user.is_admin)
+
+  const handleDelete = () => {
+    if (!window.confirm('Delete this comment?')) return
+    del.mutate({ commentId: c.id, scope })
+  }
 
   // Resolve quote char_start → video timestamp
   const quoteMs =
@@ -54,7 +62,7 @@ export default function CommentItem({ comment: c, scope, depth, turnRef }: Comme
     <div style={{ marginLeft: indent > 0 ? `${indent * 1.25}rem` : 0 }}>
       <div className="py-2">
         {/* Quote blockquote */}
-        {c.quoted_text && (
+        {!c.is_deleted && c.quoted_text && (
           <blockquote className="mb-1.5 border-l-4 border-amber-400 pl-3 text-xs text-gray-500 italic">
             <span>"{c.quoted_text}"</span>
             {quoteMs != null && (
@@ -76,39 +84,41 @@ export default function CommentItem({ comment: c, scope, depth, turnRef }: Comme
         {/* Meta row */}
         <div className="flex items-center gap-3 mt-1">
           {/* Vote */}
-          <div className="flex items-center gap-1">
-            <button
-              onClick={() => castVote(1)}
-              disabled={!user || vote.isPending}
-              title="Upvote"
-              className={`text-xs px-1 rounded transition-colors disabled:opacity-40 ${
-                c.user_vote === 1
-                  ? 'text-emerald-600 font-bold'
-                  : 'text-gray-400 hover:text-emerald-600'
-              }`}
-            >
-              ▲
-            </button>
-            <span className={`text-xs tabular-nums min-w-[1.5ch] text-center ${
-              c.score > 0 ? 'text-emerald-600' : c.score < 0 ? 'text-red-500' : 'text-gray-400'
-            }`}>
-              {c.score}
-            </span>
-            <button
-              onClick={() => castVote(-1)}
-              disabled={!user || vote.isPending}
-              title="Downvote"
-              className={`text-xs px-1 rounded transition-colors disabled:opacity-40 ${
-                c.user_vote === -1
-                  ? 'text-red-500 font-bold'
-                  : 'text-gray-400 hover:text-red-500'
-              }`}
-            >
-              ▼
-            </button>
-          </div>
+          {!c.is_deleted && (
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => castVote(1)}
+                disabled={!user || vote.isPending}
+                title="Upvote"
+                className={`text-xs px-1 rounded transition-colors disabled:opacity-40 ${
+                  c.user_vote === 1
+                    ? 'text-emerald-600 font-bold'
+                    : 'text-gray-400 hover:text-emerald-600'
+                }`}
+              >
+                ▲
+              </button>
+              <span className={`text-xs tabular-nums min-w-[1.5ch] text-center ${
+                c.score > 0 ? 'text-emerald-600' : c.score < 0 ? 'text-red-500' : 'text-gray-400'
+              }`}>
+                {c.score}
+              </span>
+              <button
+                onClick={() => castVote(-1)}
+                disabled={!user || vote.isPending}
+                title="Downvote"
+                className={`text-xs px-1 rounded transition-colors disabled:opacity-40 ${
+                  c.user_vote === -1
+                    ? 'text-red-500 font-bold'
+                    : 'text-gray-400 hover:text-red-500'
+                }`}
+              >
+                ▼
+              </button>
+            </div>
+          )}
 
-          {c.author_handle && (
+          {!c.is_deleted && c.author_handle && (
             <span className="text-xs text-gray-500 font-medium">@{c.author_handle}</span>
           )}
           <span className="text-xs text-gray-400">{timeAgo(c.created_at)}</span>
@@ -119,6 +129,16 @@ export default function CommentItem({ comment: c, scope, depth, turnRef }: Comme
               className="text-xs text-gray-400 hover:text-gray-600 transition-colors"
             >
               {replying ? 'Cancel' : 'Reply'}
+            </button>
+          )}
+
+          {canDelete && (
+            <button
+              onClick={handleDelete}
+              disabled={del.isPending}
+              className="text-xs text-gray-400 hover:text-red-500 transition-colors disabled:opacity-40"
+            >
+              Delete
             </button>
           )}
         </div>

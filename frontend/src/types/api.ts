@@ -83,6 +83,7 @@ export interface HearingTranscript {
 // ── Comments ──────────────────────────────────────────────────────────────────
 export interface Comment {
   id: string
+  user_id: string
   parent_id: string | null
   turn_id: string | null
   hearing_id: string | null

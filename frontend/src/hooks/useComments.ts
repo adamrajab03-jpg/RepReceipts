@@ -120,3 +120,52 @@ export function useVoteComment() {
     },
   })
 }
+
+// ── Delete (soft) ─────────────────────────────────────────────────────────────
+export interface DeleteCommentInput {
+  commentId: string
+  scope:     CommentScope
+}
+
+export function useDeleteComment() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: async ({ commentId }: DeleteCommentInput) => {
+      const res = await apiFetch(`/api/comments/${commentId}`, { method: 'DELETE' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Failed to delete comment')
+      return data.data as { id: string; is_deleted: true }
+    },
+
+    onMutate: async ({ commentId, scope }) => {
+      const key = scopeKey(scope)
+      await qc.cancelQueries({ queryKey: key })
+      const snapshot = qc.getQueryData<Comment[]>(key)
+
+      qc.setQueryData<Comment[]>(key, old =>
+        old?.map(c =>
+          c.id === commentId
+            ? {
+                ...c,
+                body: '[deleted]',
+                is_deleted: true,
+                quoted_text: null,
+                char_start: null,
+                char_end: null,
+                user_vote: null,
+              }
+            : c
+        )
+      )
+      return { snapshot }
+    },
+
+    onError: (_err, { scope }, ctx) => {
+      if (ctx?.snapshot) qc.setQueryData(scopeKey(scope), ctx.snapshot)
+    },
+
+    onSettled: (_data, _err, { scope }) => {
+      qc.invalidateQueries({ queryKey: scopeKey(scope) })
+    },
+  })
+}

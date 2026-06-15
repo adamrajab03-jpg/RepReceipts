@@ -21,7 +21,7 @@ async function queryComments(whereClause, params, res) {
   try {
     const { rows } = await db.query(`
       SELECT
-        c.id, c.parent_id, c.turn_id, c.hearing_id,
+        c.id, c.user_id, c.parent_id, c.turn_id, c.hearing_id,
         CASE WHEN c.is_deleted THEN '[deleted]' ELSE c.body END AS body,
         c.score, c.is_deleted, c.created_at,
         u.handle   AS author_handle,
@@ -73,7 +73,7 @@ async function createComment(isTurn, targetId, req, res) {
     const { rows } = await client.query(`
       INSERT INTO comments (user_id, turn_id, hearing_id, parent_id, body)
       VALUES ($1, $2, $3, $4, $5)
-      RETURNING id, turn_id, hearing_id, parent_id, body, score, is_deleted, created_at
+      RETURNING id, user_id, turn_id, hearing_id, parent_id, body, score, is_deleted, created_at
     `, [
       req.user.id,
       isTurn    ? targetId : null,
@@ -195,8 +195,45 @@ async function voteComment(req, res) {
   }
 }
 
+// ── Soft delete (author or admin) ─────────────────────────────────────────────
+async function deleteComment(req, res) {
+  const { id } = req.params;
+  const userId = req.user.id;
+
+  try {
+    const { rows } = await db.query(
+      'SELECT user_id, is_deleted FROM comments WHERE id = $1',
+      [id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Comment not found' });
+    }
+    const comment = rows[0];
+
+    if (comment.is_deleted) {
+      return res.json({ data: { id, is_deleted: true } });
+    }
+
+    const { rows: userRows } = await db.query(
+      'SELECT is_admin FROM users WHERE id = $1',
+      [userId]
+    );
+    const isAdmin = userRows[0]?.is_admin === true;
+
+    if (comment.user_id !== userId && !isAdmin) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    await db.query('UPDATE comments SET is_deleted = true WHERE id = $1', [id]);
+    return res.json({ data: { id, is_deleted: true } });
+  } catch (err) {
+    console.error('deleteComment error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
 module.exports = {
   listTurnComments, listHearingComments,
   createTurnComment, createHearingComment,
-  voteComment,
+  voteComment, deleteComment,
 };
