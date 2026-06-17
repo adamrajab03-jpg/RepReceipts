@@ -90,4 +90,29 @@ async function getMember(req, res) {
   }
 }
 
-module.exports = { listMembers, getMember };
+async function getMemberTopics(req, res) {
+  try {
+    const { rows } = await db.query(`
+      SELECT
+        t.id, t.slug, t.name,
+        p.id   AS parent_id,
+        p.slug AS parent_slug,
+        p.name AS parent_name,
+        COUNT(DISTINCT tt.turn_id)::int AS turn_count
+      FROM   turn_topics  tt
+      JOIN   speaker_turns st ON st.id = tt.turn_id
+      JOIN   topics        t  ON t.id  = tt.topic_id
+      LEFT JOIN topics     p  ON p.id  = t.parent_id
+      WHERE  st.member_id = $1
+      GROUP BY t.id, p.id
+      ORDER BY turn_count DESC, t.name
+    `, [req.params.id]);
+
+    res.json({ data: rows, count: rows.length });
+  } catch (err) {
+    console.error('getMemberTopics error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+module.exports = { listMembers, getMember, getMemberTopics };

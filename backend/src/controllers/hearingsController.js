@@ -2,7 +2,7 @@ const db = require('../utils/db');
 
 async function listHearings(req, res) {
   try {
-    const { committee_id, status, congress } = req.query;
+    const { committee_id, status, congress, topic, member } = req.query;
 
     const conditions = [];
     const params = [];
@@ -18,6 +18,29 @@ async function listHearings(req, res) {
     if (congress) {
       params.push(parseInt(congress, 10));
       conditions.push(`h.congress = $${params.length}`);
+    }
+    if (topic || member) {
+      const sub = [];
+      let join = '';
+      if (topic) {
+        params.push(topic);
+        join += `
+          JOIN turn_topics tt ON tt.turn_id = st.id
+          JOIN topics      t  ON t.id = tt.topic_id
+        `;
+        sub.push(`t.slug = $${params.length}`);
+      }
+      if (member) {
+        params.push(member);
+        sub.push(`st.member_id = $${params.length}`);
+      }
+      conditions.push(`EXISTS (
+        SELECT 1
+        FROM   transcripts tr
+        JOIN   speaker_turns st ON st.transcript_id = tr.id
+        ${join}
+        WHERE  tr.hearing_id = h.id AND ${sub.join(' AND ')}
+      )`);
     }
 
     const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
@@ -107,7 +130,15 @@ async function getHearingTranscript(req, res) {
         st.start_ms, st.end_ms, st.attribution_status,
         st.raw_text, st.clean_text, st.word_times, st.is_edited,
         m.full_name AS member_full_name, m.bioguide_id,
-        m.party, m.state, m.chamber
+        m.party, m.state, m.chamber,
+        COALESCE(
+          (SELECT json_agg(json_build_object('id', t.id, 'slug', t.slug, 'name', t.name)
+                           ORDER BY t.name)
+             FROM turn_topics tt
+             JOIN topics t ON t.id = tt.topic_id
+            WHERE tt.turn_id = st.id),
+          '[]'
+        ) AS topics
       FROM speaker_turns st
       LEFT JOIN members m ON m.id = st.member_id
       WHERE st.transcript_id = $1

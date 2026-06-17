@@ -65,4 +65,22 @@ async function requireAuth(req, res, next) {
   }
 }
 
-module.exports = { requireAuth };
+// Best-effort auth for read endpoints: if a valid access token is present,
+// attach req.user so the response can include the viewer's own vote/rating.
+// Never blocks — anonymous and expired-token requests fall through cleanly,
+// and (unlike requireAuth) it performs no refresh rotation, keeping reads
+// free of side effects.
+function optionalAuth(req, _res, next) {
+  const rawAccess = req.cookies?.access_token;
+  if (rawAccess) {
+    try {
+      const payload = verifyAccessToken(rawAccess);
+      req.user = { id: payload.sub, handle: payload.handle };
+    } catch {
+      // invalid or expired — proceed anonymously
+    }
+  }
+  return next();
+}
+
+module.exports = { requireAuth, optionalAuth };

@@ -170,6 +170,20 @@ export default function SpeakerTurn({ turn, index }: { turn: Turn; index: number
         )}
       </div>
 
+      {turn.topics?.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 mb-2">
+          {turn.topics.map(t => (
+            <Link
+              key={t.id}
+              to={`/hearings?topic=${t.slug}`}
+              className="text-xs px-2 py-0.5 rounded-full bg-teal-50 text-teal-700 border border-teal-200 hover:bg-teal-100 transition-colors"
+            >
+              {t.name}
+            </Link>
+          ))}
+        </div>
+      )}
+
       {/* Word-token paragraph — textContent === clean_text ?? raw_text */}
       <p
         ref={paragraphRef}

@@ -7,6 +7,10 @@ const hearingsRouter = require('./routes/hearings');
 const authRouter     = require('./routes/auth');
 const turnsRouter    = require('./routes/turns');
 const commentsRouter = require('./routes/comments');
+const topicsRouter   = require('./routes/topics');
+const approvalRouter = require('./routes/approval');
+const followsRouter  = require('./routes/follows');
+const notificationsRouter = require('./routes/notifications');
 
 // ── CSRF (double-submit signed cookie, SameSite=Strict is primary defence) ───
 const {
@@ -50,6 +54,10 @@ app.use('/api/members',  membersRouter);
 app.use('/api/hearings', hearingsRouter);
 app.use('/api/turns',    turnsRouter);
 app.use('/api/comments', commentsRouter);
+app.use('/api/topics',   topicsRouter);
+app.use('/api/approval', approvalRouter);
+app.use('/api/follows',  followsRouter);
+app.use('/api/notifications', notificationsRouter);
 
 // ── Error handler ─────────────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars

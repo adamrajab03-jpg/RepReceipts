@@ -2,6 +2,7 @@ import { NavLink, Outlet, Link } from 'react-router-dom'
 import { cn } from '../utils/cn'
 import { useAuthStore } from '../store/authStore'
 import { useLogout } from '../hooks/useAuth'
+import NotificationBell from './NotificationBell'
 
 export default function Layout() {
   const user   = useAuthStore(s => s.user)
@@ -33,9 +34,32 @@ export default function Layout() {
             Hearings
           </NavLink>
 
+          <NavLink
+            to="/heatmap"
+            className={({ isActive }) =>
+              cn('text-sm font-medium transition-colors hover:text-white',
+                isActive ? 'text-white' : 'text-slate-400')
+            }
+          >
+            Heat Map
+          </NavLink>
+
+          {user && (
+            <NavLink
+              to="/following"
+              className={({ isActive }) =>
+                cn('text-sm font-medium transition-colors hover:text-white',
+                  isActive ? 'text-white' : 'text-slate-400')
+              }
+            >
+              Following
+            </NavLink>
+          )}
+
           <div className="ml-auto flex items-center gap-4">
             {user ? (
               <>
+                <NotificationBell />
                 <span className="text-sm text-slate-300">@{user.handle}</span>
                 <button
                   onClick={() => logout.mutate()}

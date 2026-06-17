@@ -5,6 +5,8 @@ interface HearingsFilter {
   committee_id?: string
   status?: string
   congress?: string
+  topic?: string
+  member?: string
 }
 
 async function fetchHearings(filters: HearingsFilter): Promise<ListResponse<Hearing>> {

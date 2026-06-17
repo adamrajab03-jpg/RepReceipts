@@ -5,9 +5,13 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "predev": "kill-port 3000",
     "dev": "node --watch src/index.js",
     "migrate": "node db/migrate.js",
     "seed": "node db/seeds/seed.js"
+  },
+  "devDependencies": {
+    "kill-port": "^2.0.1"
   },
   "dependencies": {
     "argon2": "^0.44.0",

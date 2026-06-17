@@ -1,5 +1,6 @@
 const { z } = require('zod');
 const db = require('../utils/db');
+const { createCommentNotifications } = require('./notificationsController');
 
 // ── Zod schemas ───────────────────────────────────────────────────────────────
 const commentSchema = z.object({
@@ -90,6 +91,15 @@ async function createComment(isTurn, targetId, req, res) {
         VALUES ($1, $2, $3, $4, $5)
       `, [comment.id, targetId, quote.char_start, quote.char_end, quote.quoted_text]);
       quoteData = { char_start: quote.char_start, char_end: quote.char_end, quoted_text: quote.quoted_text };
+    }
+
+    // Notify followers of the turn's member / tagged topics (turn comments only).
+    if (isTurn) {
+      await createCommentNotifications(client, {
+        commentId: comment.id,
+        turnId:    targetId,
+        authorId:  req.user.id,
+      });
     }
 
     await client.query('COMMIT');
