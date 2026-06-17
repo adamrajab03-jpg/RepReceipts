@@ -1,6 +1,6 @@
 const { z } = require('zod');
 const db = require('../utils/db');
-const { createCommentNotifications } = require('./notificationsController');
+const { createReplyAndMentionNotifications } = require('./notificationsController');
 
 // ── Zod schemas ───────────────────────────────────────────────────────────────
 const commentSchema = z.object({
@@ -93,14 +93,34 @@ async function createComment(isTurn, targetId, req, res) {
       quoteData = { char_start: quote.char_start, char_end: quote.char_end, quoted_text: quote.quoted_text };
     }
 
-    // Notify followers of the turn's member / tagged topics (turn comments only).
+    // Reply + @mention notifications (Part 3). These fire on comment creation;
+    // congressional-activity notifications (Part 2) fire from the ingestion path
+    // instead. Resolve the hearing + turn anchor for the notification link.
+    let hearingId = isTurn ? null : targetId;
+    let turnSeq   = null;
     if (isTurn) {
-      await createCommentNotifications(client, {
-        commentId: comment.id,
-        turnId:    targetId,
-        authorId:  req.user.id,
-      });
+      const { rows: turnRows } = await client.query(`
+        SELECT st.seq, tr.hearing_id
+        FROM   speaker_turns st
+        JOIN   transcripts   tr ON tr.id = st.transcript_id
+        WHERE  st.id = $1
+      `, [targetId]);
+      if (turnRows.length) {
+        turnSeq   = turnRows[0].seq;
+        hearingId = turnRows[0].hearing_id;
+      }
     }
+
+    await createReplyAndMentionNotifications(client, {
+      commentId:    comment.id,
+      hearingId,
+      turnId:       isTurn ? targetId : null,
+      turnSeq,
+      authorId:     req.user.id,
+      authorHandle: req.user.handle,
+      body,
+      parentId:     parent_id,
+    });
 
     await client.query('COMMIT');
 

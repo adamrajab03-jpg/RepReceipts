@@ -4,6 +4,7 @@ import { type CommentScope, useVoteComment, useDeleteComment } from '../hooks/us
 import { useAuthStore } from '../store/authStore'
 import { resolveToMs, msToTimestamp } from '../utils/resolveMs'
 import CommentForm from './CommentForm'
+import { renderCommentBody } from '../utils/mentions'
 
 const MAX_INDENT = 4
 
@@ -78,7 +79,7 @@ export default function CommentItem({ comment: c, scope, depth, turnRef }: Comme
 
         {/* Body */}
         <p className={`text-sm ${c.is_deleted ? 'text-gray-400 italic' : 'text-gray-800'}`}>
-          {c.body}
+          {c.is_deleted ? c.body : renderCommentBody(c.body)}
         </p>
 
         {/* Meta row */}

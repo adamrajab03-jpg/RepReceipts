@@ -3,8 +3,18 @@ import { Link } from 'react-router-dom'
 import {
   useNotifications, useUnreadCount, useMarkRead, useMarkAllRead,
 } from '../hooks/useNotifications'
-import type { AppNotification } from '../types/api'
+import type { AppNotification, NotificationKind } from '../types/api'
 import { cn } from '../utils/cn'
+
+// Icon per notification kind. rep/topic/rep+topic = system activity; reply &
+// mention = social. Falls back to a generic dot for any unknown future kind.
+const KIND_ICON: Record<NotificationKind, string> = {
+  rep_activity:       '🏛️',
+  topic_activity:     '🏷️',
+  rep_topic_activity: '🎯',
+  reply:              '↩️',
+  mention:            '@',
+}
 
 function timeAgo(iso: string): string {
   const m = Math.floor((Date.now() - new Date(iso).getTime()) / 60000)
@@ -76,7 +86,10 @@ export default function NotificationBell() {
               >
                 <div className="flex items-start gap-2">
                   {!n.read_at && <span className="mt-1.5 w-2 h-2 rounded-full bg-teal-500 shrink-0" />}
-                  <div className={cn(n.read_at && 'pl-4')}>
+                  <span className={cn('text-sm leading-5 shrink-0', n.read_at && 'pl-4')}>
+                    {KIND_ICON[n.payload.kind] ?? '•'}
+                  </span>
+                  <div>
                     <p className="text-sm text-gray-800">{n.payload.text}</p>
                     <p className="text-xs text-gray-400 mt-0.5">{timeAgo(n.created_at)}</p>
                   </div>

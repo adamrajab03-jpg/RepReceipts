@@ -82,9 +82,9 @@ export default function HearingsPage() {
               Topic: {selectedTopic?.name ?? topic}
               {selectedTopic && (
                 <FollowButton
-                  type="topic"
+                  kind="topic"
                   variant="star"
-                  display={{ id: selectedTopic.id, slug: selectedTopic.slug, name: selectedTopic.name }}
+                  topic={{ id: selectedTopic.id, slug: selectedTopic.slug, name: selectedTopic.name }}
                 />
               )}
               <button

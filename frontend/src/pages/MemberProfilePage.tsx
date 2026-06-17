@@ -67,8 +67,8 @@ export default function MemberProfilePage() {
               </span>
             )}
             <FollowButton
-              type="member"
-              display={{ id: m.id, full_name: m.full_name, party: m.party, state: m.state, chamber: m.chamber }}
+              kind="member"
+              member={{ id: m.id, full_name: m.full_name, party: m.party, state: m.state, chamber: m.chamber }}
             />
           </div>
         </div>
@@ -119,7 +119,10 @@ export default function MemberProfilePage() {
       </div>
 
       <div>
-        <h2 className="text-lg font-semibold text-gray-800 mb-3">Topics spoken on</h2>
+        <h2 className="text-lg font-semibold text-gray-800 mb-1">Topics spoken on</h2>
+        <p className="text-xs text-gray-400 mb-3">
+          Tap <span className="text-violet-600">◇</span> to follow {m.full_name} specifically on that topic.
+        </p>
         {topicsQ.isLoading && <p className="text-sm text-gray-500">Loading…</p>}
         {topicsQ.data && topicsQ.data.count === 0 && (
           <p className="text-sm text-gray-500">No tagged turns yet.</p>
@@ -142,7 +145,11 @@ export default function MemberProfilePage() {
                         {t.name}
                         <span className="ml-1 text-teal-500">· {t.turn_count}</span>
                       </Link>
-                      <FollowButton type="topic" variant="star" display={{ id: t.id, slug: t.slug, name: t.name }} />
+                      <FollowButton
+                        kind="rep_topic"
+                        member={{ id: m.id, full_name: m.full_name, party: m.party, state: m.state, chamber: m.chamber }}
+                        topic={{ id: t.id, slug: t.slug, name: t.name }}
+                      />
                     </span>
                   ))}
                 </div>

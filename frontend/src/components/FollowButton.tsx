@@ -1,34 +1,87 @@
 import { useAuthStore } from '../store/authStore'
 import {
-  useIsFollowing, useFollow, useUnfollow, type FollowType,
+  useIsFollowing, useIsFollowingRepTopic, useFollow, useUnfollow,
 } from '../hooks/useFollows'
-import type { FollowsState } from '../types/api'
+import type { MemberFollow, TopicFollow } from '../types/api'
 import { cn } from '../utils/cn'
 
-type Display =
-  | FollowsState['members'][number]
-  | FollowsState['topics'][number]
+// Three follow shapes. 'member'/'topic' render a button or a star; 'rep_topic'
+// (follow a rep scoped to a topic) renders a diamond, visually distinct from the
+// bare-topic star so the user knows which they're toggling.
+type FollowButtonProps =
+  | { kind: 'member'; member: MemberFollow; variant?: 'button' | 'star' }
+  | { kind: 'topic'; topic: TopicFollow; variant?: 'button' | 'star' }
+  | { kind: 'rep_topic'; member: MemberFollow; topic: TopicFollow }
 
-interface FollowButtonProps {
-  type: FollowType
-  display: Display          // row inserted optimistically; display.id is the target
-  variant?: 'button' | 'star'
-}
+export default function FollowButton(props: FollowButtonProps) {
+  const user     = useAuthStore(s => s.user)
+  const follow   = useFollow()
+  const unfollow = useUnfollow()
 
-export default function FollowButton({ type, display, variant = 'button' }: FollowButtonProps) {
-  const user      = useAuthStore(s => s.user)
-  const following = useIsFollowing(type, display.id)
-  const follow    = useFollow()
-  const unfollow  = useUnfollow()
+  // Hooks must run unconditionally; compute "following" for every shape.
+  const memberId = props.kind === 'member' ? props.member.id
+                 : props.kind === 'rep_topic' ? props.member.id : ''
+  const topicId  = props.kind === 'topic' ? props.topic.id
+                 : props.kind === 'rep_topic' ? props.topic.id : ''
+  const followingMember = useIsFollowing('member', memberId)
+  const followingTopic  = useIsFollowing('topic', topicId)
+  const followingRepTopic = useIsFollowingRepTopic(memberId, topicId)
 
   if (!user) return null
 
   const pending = follow.isPending || unfollow.isPending
+
+  const following =
+    props.kind === 'member'    ? followingMember :
+    props.kind === 'topic'     ? followingTopic  :
+                                 followingRepTopic
+
   const toggle = () => {
     if (pending) return
-    if (following) unfollow.mutate({ type, id: display.id })
-    else           follow.mutate({ type, id: display.id, display })
+    if (props.kind === 'member') {
+      if (following) unfollow.mutate({ kind: 'member', member_id: props.member.id })
+      else           follow.mutate({ kind: 'member', member_id: props.member.id, display: props.member })
+    } else if (props.kind === 'topic') {
+      if (following) unfollow.mutate({ kind: 'topic', topic_id: props.topic.id })
+      else           follow.mutate({ kind: 'topic', topic_id: props.topic.id, display: props.topic })
+    } else {
+      const { member, topic } = props
+      if (following) {
+        unfollow.mutate({ kind: 'rep_topic', member_id: member.id, topic_id: topic.id })
+      } else {
+        follow.mutate({
+          kind: 'rep_topic', member_id: member.id, topic_id: topic.id,
+          display: {
+            member_id: member.id, member_full_name: member.full_name,
+            party: member.party, state: member.state,
+            topic_id: topic.id, topic_slug: topic.slug, topic_name: topic.name,
+          },
+        })
+      }
+    }
   }
+
+  // rep+topic: violet diamond, distinct from the amber bare-topic star.
+  if (props.kind === 'rep_topic') {
+    return (
+      <button
+        onClick={toggle}
+        disabled={pending}
+        aria-pressed={following}
+        title={following
+          ? `Following ${props.member.full_name} on ${props.topic.name} — click to unfollow`
+          : `Follow ${props.member.full_name} on ${props.topic.name}`}
+        className={cn(
+          'text-xs leading-none transition-colors disabled:opacity-40',
+          following ? 'text-violet-600 hover:text-violet-700' : 'text-gray-300 hover:text-violet-500'
+        )}
+      >
+        {following ? '◆' : '◇'}
+      </button>
+    )
+  }
+
+  const variant = props.variant ?? 'button'
 
   if (variant === 'star') {
     return (

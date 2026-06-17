@@ -5,6 +5,8 @@ const { requireAuth } = require('../middleware/auth');
 const router = Router();
 router.get('/', requireAuth, listFollows);
 router.post('/', requireAuth, follow);
-router.delete('/:type/:id', requireAuth, unfollow);
+// DELETE takes the same JSON body shapes as POST so it can target a precise
+// follow shape (rep-only / topic-only / rep+topic).
+router.delete('/', requireAuth, unfollow);
 
 module.exports = router;

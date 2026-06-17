@@ -1,13 +1,15 @@
 const { z } = require('zod');
 const db = require('../utils/db');
 
-// Exactly one of member_id / topic_id, mirroring the follows CHECK constraint.
+// At least one of member_id / topic_id, mirroring the follows_target_check
+// constraint. The three valid shapes are { member_id }, { topic_id }, and
+// { member_id, topic_id }.
 const followSchema = z.object({
   member_id: z.string().uuid().optional(),
   topic_id:  z.string().uuid().optional(),
 }).refine(
-  d => (d.member_id ? 1 : 0) + (d.topic_id ? 1 : 0) === 1,
-  { message: 'Provide exactly one of member_id or topic_id' }
+  d => !!d.member_id || !!d.topic_id,
+  { message: 'Provide member_id, topic_id, or both' }
 );
 
 // ── Follow (idempotent) ───────────────────────────────────────────────────────
@@ -20,19 +22,13 @@ async function follow(req, res) {
   const userId = req.user.id;
 
   try {
-    // ON CONFLICT infers the matching partial unique index
-    // (uq_follow_member / uq_follow_topic), so re-following is a no-op.
-    if (member_id) {
-      await db.query(`
-        INSERT INTO follows (user_id, member_id) VALUES ($1, $2)
-        ON CONFLICT (user_id, member_id) WHERE member_id IS NOT NULL DO NOTHING
-      `, [userId, member_id]);
-    } else {
-      await db.query(`
-        INSERT INTO follows (user_id, topic_id) VALUES ($1, $2)
-        ON CONFLICT (user_id, topic_id) WHERE topic_id IS NOT NULL DO NOTHING
-      `, [userId, topic_id]);
-    }
+    // No conflict target: a bare ON CONFLICT DO NOTHING lets Postgres match
+    // whichever of the three partial unique indexes applies to this shape, so
+    // re-following any shape is a no-op.
+    await db.query(`
+      INSERT INTO follows (user_id, member_id, topic_id) VALUES ($1, $2, $3)
+      ON CONFLICT DO NOTHING
+    `, [userId, member_id, topic_id]);
     return res.status(201).json({ data: { member_id, topic_id, following: true } });
   } catch (err) {
     if (err.code === '23503') {          // FK violation — target doesn't exist
@@ -44,27 +40,39 @@ async function follow(req, res) {
 }
 
 // ── Unfollow ──────────────────────────────────────────────────────────────────
+// Takes the same body shapes as follow (DELETE /api/follows). The WHERE clause
+// targets the exact shape so unfollowing a rep+topic doesn't touch a bare rep
+// follow for the same member (and vice versa).
 async function unfollow(req, res) {
-  const { type, id } = req.params;
-  if (type !== 'member' && type !== 'topic') {
-    return res.status(400).json({ error: 'type must be member or topic' });
+  const parsed = followSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0].message });
   }
-  const column = type === 'member' ? 'member_id' : 'topic_id';
+  const { member_id = null, topic_id = null } = parsed.data;
   const userId = req.user.id;
 
+  let where, params;
+  if (member_id && topic_id) {
+    where  = 'member_id = $2 AND topic_id = $3';
+    params = [userId, member_id, topic_id];
+  } else if (member_id) {
+    where  = 'member_id = $2 AND topic_id IS NULL';
+    params = [userId, member_id];
+  } else {
+    where  = 'topic_id = $2 AND member_id IS NULL';
+    params = [userId, topic_id];
+  }
+
   try {
-    await db.query(
-      `DELETE FROM follows WHERE user_id = $1 AND ${column} = $2`,
-      [userId, id]
-    );
-    return res.json({ data: { [column]: id, following: false } });
+    await db.query(`DELETE FROM follows WHERE user_id = $1 AND ${where}`, params);
+    return res.json({ data: { member_id, topic_id, following: false } });
   } catch (err) {
     console.error('unfollow error:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 }
 
-// ── Current user's follows ────────────────────────────────────────────────────
+// ── Current user's follows (three groups) ─────────────────────────────────────
 async function listFollows(req, res) {
   const userId = req.user.id;
   try {
@@ -72,7 +80,7 @@ async function listFollows(req, res) {
       SELECT m.id, m.full_name, m.party, m.state, m.chamber
       FROM   follows f
       JOIN   members m ON m.id = f.member_id
-      WHERE  f.user_id = $1 AND f.member_id IS NOT NULL
+      WHERE  f.user_id = $1 AND f.member_id IS NOT NULL AND f.topic_id IS NULL
       ORDER  BY m.full_name
     `, [userId]);
 
@@ -80,11 +88,21 @@ async function listFollows(req, res) {
       SELECT t.id, t.slug, t.name
       FROM   follows f
       JOIN   topics t ON t.id = f.topic_id
-      WHERE  f.user_id = $1 AND f.topic_id IS NOT NULL
+      WHERE  f.user_id = $1 AND f.topic_id IS NOT NULL AND f.member_id IS NULL
       ORDER  BY t.name
     `, [userId]);
 
-    return res.json({ data: { members, topics } });
+    const { rows: repTopics } = await db.query(`
+      SELECT m.id AS member_id, m.full_name AS member_full_name, m.party, m.state,
+             t.id AS topic_id,  t.slug AS topic_slug, t.name AS topic_name
+      FROM   follows f
+      JOIN   members m ON m.id = f.member_id
+      JOIN   topics  t ON t.id = f.topic_id
+      WHERE  f.user_id = $1 AND f.member_id IS NOT NULL AND f.topic_id IS NOT NULL
+      ORDER  BY m.full_name, t.name
+    `, [userId]);
+
+    return res.json({ data: { members, topics, repTopics } });
   } catch (err) {
     console.error('listFollows error:', err);
     return res.status(500).json({ error: 'Internal server error' });

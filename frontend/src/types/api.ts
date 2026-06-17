@@ -160,17 +160,36 @@ export interface VoteResult {
 }
 
 // ── Follows + notifications ─────────────────────────────────────────────────
-export interface FollowsState {
-  members: { id: string; full_name: string; party: string | null; state: string | null; chamber: string | null }[]
-  topics: { id: string; slug: string; name: string }[]
+export interface MemberFollow {
+  id: string; full_name: string; party: string | null; state: string | null; chamber: string | null
+}
+export interface TopicFollow {
+  id: string; slug: string; name: string
+}
+// A follow of a specific rep scoped to a specific topic.
+export interface RepTopicFollow {
+  member_id: string; member_full_name: string; party: string | null; state: string | null
+  topic_id: string; topic_slug: string; topic_name: string
 }
 
+export interface FollowsState {
+  members: MemberFollow[]
+  topics: TopicFollow[]
+  repTopics: RepTopicFollow[]
+}
+
+export type NotificationKind =
+  | 'rep_activity' | 'topic_activity' | 'rep_topic_activity'
+  | 'reply' | 'mention'
+
 export interface NotificationPayload {
-  kind: string
+  kind: NotificationKind
   text: string
   link: string
   comment_id?: string
   hearing_id?: string
+  member_id?: string
+  topic_id?: string
 }
 
 export interface AppNotification {
