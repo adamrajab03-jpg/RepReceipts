@@ -1,12 +1,14 @@
-import { NavLink, Outlet, Link } from 'react-router-dom'
+import { NavLink, Outlet, Link, useLocation } from 'react-router-dom'
 import { cn } from '../utils/cn'
 import { useAuthStore } from '../store/authStore'
 import { useLogout } from '../hooks/useAuth'
 import NotificationBell from './NotificationBell'
+import ZipSearch from './ZipSearch'
 
 export default function Layout() {
   const user   = useAuthStore(s => s.user)
   const logout = useLogout()
+  const { pathname } = useLocation()
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -57,6 +59,8 @@ export default function Layout() {
           )}
 
           <div className="ml-auto flex items-center gap-4">
+            {/* Compact ZIP search on every page except the homepage (which has the hero). */}
+            {pathname !== '/' && <ZipSearch />}
             {user ? (
               <>
                 <NotificationBell />

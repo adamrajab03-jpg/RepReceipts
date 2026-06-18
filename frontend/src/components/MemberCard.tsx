@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom'
 import type { Member } from '../types/api'
 import { cn } from '../utils/cn'
+import { districtTag } from '../utils/districtLabel'
 
 function partyBadge(party: string | null) {
   if (party === 'D') return 'bg-blue-100 text-blue-700'
@@ -10,7 +11,8 @@ function partyBadge(party: string | null) {
 
 function locationLabel(m: Member) {
   if (!m.state) return null
-  return m.district ? `${m.state}-${m.district}` : m.state
+  const tag = districtTag(m.state, m.district)
+  return tag ? `${m.state}-${tag}` : m.state
 }
 
 export default function MemberCard({ member: m }: { member: Member }) {

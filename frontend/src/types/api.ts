@@ -199,6 +199,26 @@ export interface AppNotification {
   created_at: string
 }
 
+// ── Civic lookup (ZIP → representatives) ────────────────────────────────────
+export interface ResolvedRep {
+  bioguide_id: string
+  full_name: string
+  party: string | null
+  state: string
+  district: number | null      // null for senators; 0 = at-large / delegate
+  chamber: 'house' | 'senate'
+  member_id: string | null     // profile id when in our system, else null
+  in_system: boolean
+  is_delegate: boolean
+}
+
+export interface RepsLookup {
+  zip: string
+  districts: { state: string; district: number }[]
+  senate: ResolvedRep[]
+  house: ResolvedRep[]
+}
+
 export interface ListResponse<T> {
   data: T[]
   count: number

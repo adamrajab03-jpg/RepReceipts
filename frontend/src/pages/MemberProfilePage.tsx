@@ -4,6 +4,7 @@ import { useMemberTopics } from '../hooks/useTopics'
 import ApprovalGrid from '../components/ApprovalGrid'
 import FollowButton from '../components/FollowButton'
 import { cn } from '../utils/cn'
+import { districtTag } from '../utils/districtLabel'
 import type { MemberTopic } from '../types/api'
 
 const ROLE_LABEL: Record<string, string> = {
@@ -51,8 +52,10 @@ export default function MemberProfilePage() {
             <h1 className="text-2xl font-bold text-gray-900">{m.full_name}</h1>
             <p className="text-gray-500 mt-1 capitalize">
               {m.member_type}
-              {m.state && ` · ${m.state}`}
-              {m.district != null && `-${m.district}`}
+              {m.state && (() => {
+                const tag = districtTag(m.state, m.district)
+                return tag ? ` · ${m.state}-${tag}` : ` · ${m.state}`
+              })()}
             </p>
           </div>
           <div className="flex flex-col items-end gap-2 shrink-0">

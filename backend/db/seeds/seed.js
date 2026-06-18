@@ -62,7 +62,7 @@ async function seed() {
 
     const { rows: members } = await client.query(`
       INSERT INTO members (bioguide_id, full_name, member_type, chamber, party, state, district) VALUES
-        ('S000001', 'Jane Smith',      'senator',        'senate', 'D', 'CA', NULL),
+        ('P000145', 'Jane Smith',      'senator',        'senate', 'D', 'CA', NULL),
         ('S000002', 'Robert Johnson',  'senator',        'senate', 'R', 'TX', NULL),
         ('S000003', 'Patricia Lee',    'senator',        'senate', 'D', 'WA', NULL),
         ('R000001', 'Maria Garcia',    'representative', 'house',  'D', 'NY', 14),

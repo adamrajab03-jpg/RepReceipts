@@ -1,6 +1,8 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { useMe } from './hooks/useAuth'
 import Layout from './components/Layout'
+import HomePage from './pages/HomePage'
+import RepsLookupPage from './pages/RepsLookupPage'
 import MembersPage from './pages/MembersPage'
 import MemberProfilePage from './pages/MemberProfilePage'
 import HearingsPage from './pages/HearingsPage'
@@ -22,7 +24,8 @@ export default function App() {
       <AuthInit />
       <Routes>
         <Route path="/" element={<Layout />}>
-          <Route index element={<Navigate to="/members" replace />} />
+          <Route index element={<HomePage />} />
+          <Route path="reps"        element={<RepsLookupPage />} />
           <Route path="members"     element={<MembersPage />} />
           <Route path="members/:id" element={<MemberProfilePage />} />
           <Route path="hearings"    element={<HearingsPage />} />
