@@ -1,0 +1,4 @@
+# Raw upstream downloads (multi-MB). The committed slim snapshots in this dir
+# (legislators-current.json, zip-districts.csv) are derived from these by
+# build-civic-snapshots.js. See README.md to re-fetch.
+raw/

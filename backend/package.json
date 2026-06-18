@@ -8,9 +8,12 @@
     "predev": "kill-port 3000",
     "dev": "node --watch src/index.js",
     "migrate": "node db/migrate.js",
-    "seed": "node db/seeds/seed.js"
+    "seed": "node db/seeds/seed.js",
+    "import:civic": "node db/import-civic-data.js",
+    "build:civic-snapshots": "node db/build-civic-snapshots.js"
   },
   "devDependencies": {
+    "js-yaml": "^4.2.0",
     "kill-port": "^2.0.1"
   },
   "dependencies": {
