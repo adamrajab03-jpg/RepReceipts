@@ -160,7 +160,7 @@ async function createReplyAndMentionNotifications(
              jsonb_build_object(
                'kind',       'reply',
                'text',       $1 || ' replied to your comment',
-               'link',       $2,
+               'link',       $2::text,
                'hearing_id', $3::uuid,
                'comment_id', $4::uuid
              )
@@ -180,7 +180,7 @@ async function createReplyAndMentionNotifications(
              jsonb_build_object(
                'kind',       'mention',
                'text',       $1 || ' mentioned you in a comment',
-               'link',       $2,
+               'link',       $2::text,
                'hearing_id', $3::uuid,
                'comment_id', $4::uuid
              )
