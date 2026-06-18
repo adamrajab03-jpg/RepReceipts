@@ -31,6 +31,12 @@ export default function FollowButton(props: FollowButtonProps) {
 
   const pending = follow.isPending || unfollow.isPending
 
+  // Context label used in tooltips/aria — names exactly what the button follows.
+  const contextLabel =
+    props.kind === 'topic'     ? props.topic.name :
+    props.kind === 'member'    ? props.member.full_name :
+    /* rep_topic */              `${props.member.full_name} on ${props.topic.name}`
+
   const following =
     props.kind === 'member'    ? followingMember :
     props.kind === 'topic'     ? followingTopic  :
@@ -69,8 +75,8 @@ export default function FollowButton(props: FollowButtonProps) {
         disabled={pending}
         aria-pressed={following}
         title={following
-          ? `Following ${props.member.full_name} on ${props.topic.name} — click to unfollow`
-          : `Follow ${props.member.full_name} on ${props.topic.name}`}
+          ? `Following ${contextLabel} — click to unfollow`
+          : `Follow ${contextLabel}`}
         className={cn(
           'text-xs leading-none transition-colors disabled:opacity-40',
           following ? 'text-violet-600 hover:text-violet-700' : 'text-gray-300 hover:text-violet-500'
@@ -89,7 +95,7 @@ export default function FollowButton(props: FollowButtonProps) {
         onClick={toggle}
         disabled={pending}
         aria-pressed={following}
-        title={following ? 'Following — click to unfollow' : 'Follow'}
+        title={following ? `Following ${contextLabel} — click to unfollow` : `Follow ${contextLabel}`}
         className={cn(
           'text-xs leading-none transition-colors disabled:opacity-40',
           following ? 'text-amber-500 hover:text-amber-600' : 'text-gray-300 hover:text-amber-500'
@@ -105,6 +111,7 @@ export default function FollowButton(props: FollowButtonProps) {
       onClick={toggle}
       disabled={pending}
       aria-pressed={following}
+      aria-label={following ? `Following ${contextLabel}` : `Follow ${contextLabel}`}
       className={cn(
         'text-sm font-medium px-3 py-1.5 rounded-lg border transition-colors disabled:opacity-50',
         following

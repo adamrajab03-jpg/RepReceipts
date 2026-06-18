@@ -1,9 +1,11 @@
+import { useMemo } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useHearings } from '../hooks/useHearings'
 import { useTopics } from '../hooks/useTopics'
 import { useMember } from '../hooks/useMember'
 import HearingCard from '../components/HearingCard'
 import FollowButton from '../components/FollowButton'
+import type { Hearing } from '../types/api'
 
 const STATUSES = [
   { label: 'All',       value: '' },
@@ -11,6 +13,31 @@ const STATUSES = [
   { label: 'Scheduled', value: 'scheduled' },
   { label: 'Live',      value: 'live' },
 ]
+
+type CommitteeGroup = {
+  name: string
+  scheduled: Hearing[]   // upcoming — ascending by date
+  published: Hearing[]   // past     — descending by date
+}
+
+function groupByCommittee(hearings: Hearing[]): CommitteeGroup[] {
+  const map = new Map<string, CommitteeGroup>()
+  for (const h of hearings) {
+    const key = h.committee_name ?? 'Other'
+    if (!map.has(key)) map.set(key, { name: key, scheduled: [], published: [] })
+    const g = map.get(key)!
+    if (h.status === 'scheduled' || h.status === 'live') {
+      g.scheduled.push(h)
+    } else {
+      g.published.push(h)
+    }
+  }
+  for (const g of map.values()) {
+    g.scheduled.sort((a, b) => (a.held_on ?? '').localeCompare(b.held_on ?? ''))
+    g.published.sort((a, b) => (b.held_on ?? '').localeCompare(a.held_on ?? ''))
+  }
+  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name))
+}
 
 export default function HearingsPage() {
   const [params, setParams] = useSearchParams()
@@ -21,7 +48,6 @@ export default function HearingsPage() {
   const topicsQ = useTopics()
   const memberQ = useMember(member)
 
-  // Resolve the active topic slug to its {id, name} via the topics tree.
   const selectedTopic = topic
     ? topicsQ.data?.data.flatMap(a => a.children).find(c => c.slug === topic)
     : undefined
@@ -37,6 +63,10 @@ export default function HearingsPage() {
     topic:  topic  || undefined,
     member: member || undefined,
   })
+
+  const groups = useMemo(() => groupByCommittee(data?.data ?? []), [data])
+  // Whether we're locked to one status bucket (don't need subsection labels)
+  const singleStatus = status === 'scheduled' || status === 'live' || status === 'published' || status === 'processing'
 
   return (
     <div>
@@ -112,14 +142,45 @@ export default function HearingsPage() {
 
       {data && (
         <>
-          <p className="text-xs text-gray-400 mb-3">
+          <p className="text-xs text-gray-400 mb-4">
             {data.count} hearing{data.count !== 1 ? 's' : ''}
           </p>
+
           {data.count === 0 ? (
             <p className="text-sm text-gray-500">No hearings match your filters.</p>
           ) : (
-            <div className="space-y-3">
-              {data.data.map(h => <HearingCard key={h.id} hearing={h} />)}
+            <div className="space-y-1">
+              {groups.map(g => (
+                <div key={g.name}>
+                  <h2 className="sticky top-0 bg-gray-50/80 backdrop-blur-sm z-10 text-xs font-semibold uppercase tracking-wide text-gray-500 py-2 border-b border-gray-100">
+                    {g.name}
+                  </h2>
+                  <div className="pt-3 pb-6 space-y-6">
+                    {/* Scheduled (upcoming) first */}
+                    {g.scheduled.length > 0 && (
+                      <div>
+                        {!singleStatus && g.published.length > 0 && (
+                          <p className="text-xs uppercase tracking-wide text-gray-400 mb-2">Scheduled</p>
+                        )}
+                        <div className="space-y-3">
+                          {g.scheduled.map(h => <HearingCard key={h.id} hearing={h} />)}
+                        </div>
+                      </div>
+                    )}
+                    {/* Published (past) second */}
+                    {g.published.length > 0 && (
+                      <div>
+                        {!singleStatus && g.scheduled.length > 0 && (
+                          <p className="text-xs uppercase tracking-wide text-gray-400 mb-2">Published</p>
+                        )}
+                        <div className="space-y-3">
+                          {g.published.map(h => <HearingCard key={h.id} hearing={h} />)}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </>

@@ -122,10 +122,7 @@ export default function MemberProfilePage() {
       </div>
 
       <div>
-        <h2 className="text-lg font-semibold text-gray-800 mb-1">Topics spoken on</h2>
-        <p className="text-xs text-gray-400 mb-3">
-          Tap <span className="text-violet-600">◇</span> to follow {m.full_name} specifically on that topic.
-        </p>
+        <h2 className="text-lg font-semibold text-gray-800 mb-3">Topics spoken on</h2>
         {topicsQ.isLoading && <p className="text-sm text-gray-500">Loading…</p>}
         {topicsQ.data && topicsQ.data.count === 0 && (
           <p className="text-sm text-gray-500">No tagged turns yet.</p>

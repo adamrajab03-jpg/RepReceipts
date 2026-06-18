@@ -49,7 +49,7 @@ async function listMembers(req, res) {
       LEFT JOIN committees c ON c.id = cm.committee_id
       ${where}
       GROUP BY m.id
-      ORDER BY m.full_name
+      ORDER BY m.state NULLS LAST, m.full_name
     `, params);
 
     res.json({ data: rows, count: rows.length });

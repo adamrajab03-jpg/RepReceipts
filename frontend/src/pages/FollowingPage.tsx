@@ -22,7 +22,23 @@ export default function FollowingPage() {
 
   return (
     <div className="max-w-2xl">
-      <h1 className="text-2xl font-bold text-gray-900 mb-6">Following</h1>
+      <h1 className="text-2xl font-bold text-gray-900 mb-4">Following</h1>
+
+      {/* Follow-type legend */}
+      <div className="mb-6 px-4 py-3 rounded-lg border border-gray-100 bg-gray-50 text-xs text-gray-500 flex flex-wrap gap-x-6 gap-y-1.5">
+        <span>
+          <span className="font-semibold text-slate-700">Following</span>
+          {' '}— all activity from that representative
+        </span>
+        <span>
+          <span className="text-amber-500 font-medium">★</span>
+          {' '}— any hearing on that topic
+        </span>
+        <span>
+          <span className="text-violet-600 font-medium">◆</span>
+          {' '}— that representative on that specific topic only
+        </span>
+      </div>
 
       {empty && (
         <p className="text-sm text-gray-500">

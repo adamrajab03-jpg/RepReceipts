@@ -1,6 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useMembers } from '../hooks/useMembers'
 import MemberCard from '../components/MemberCard'
+import { US_STATE_NAMES } from '../utils/us-states'
+import type { Member } from '../types/api'
 
 const CHAMBERS = [
   { label: 'All',    value: '' },
@@ -13,6 +15,21 @@ const PARTIES = [
   { label: 'Democrat',   value: 'D' },
   { label: 'Republican', value: 'R' },
 ]
+
+function groupByState(members: Member[]): [string, Member[]][] {
+  const map = new Map<string, Member[]>()
+  for (const m of members) {
+    const key = m.state ?? '—'
+    if (!map.has(key)) map.set(key, [])
+    map.get(key)!.push(m)
+  }
+  // Backend already sorts by state code + full_name; sort groups by full state name.
+  return [...map.entries()].sort(([a], [b]) => {
+    if (a === '—') return 1
+    if (b === '—') return -1
+    return (US_STATE_NAMES[a] ?? a).localeCompare(US_STATE_NAMES[b] ?? b)
+  })
+}
 
 export default function MembersPage() {
   const [search, setSearch]   = useState('')
@@ -30,6 +47,8 @@ export default function MembersPage() {
     chamber: chamber || undefined,
     party:   party   || undefined,
   })
+
+  const groups = useMemo(() => groupByState(data?.data ?? []), [data])
 
   return (
     <div>
@@ -82,14 +101,24 @@ export default function MembersPage() {
 
       {data && (
         <>
-          <p className="text-xs text-gray-400 mb-3">
+          <p className="text-xs text-gray-400 mb-4">
             {data.count} member{data.count !== 1 ? 's' : ''}
           </p>
+
           {data.count === 0 ? (
             <p className="text-sm text-gray-500">No members match your filters.</p>
           ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-              {data.data.map(m => <MemberCard key={m.id} member={m} />)}
+            <div className="space-y-1">
+              {groups.map(([state, members]) => (
+                <div key={state}>
+                  <h2 className="sticky top-0 bg-gray-50/80 backdrop-blur-sm z-10 text-xs font-semibold uppercase tracking-wide text-gray-500 py-2 border-b border-gray-100">
+                    {state === '—' ? '—' : (US_STATE_NAMES[state] ?? state)}
+                  </h2>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 pt-3 pb-6">
+                    {members.map(m => <MemberCard key={m.id} member={m} />)}
+                  </div>
+                </div>
+              ))}
             </div>
           )}
         </>
