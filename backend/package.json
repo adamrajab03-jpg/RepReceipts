@@ -10,6 +10,7 @@
     "migrate": "node db/migrate.js",
     "seed": "node db/seeds/seed.js",
     "import:civic": "node db/import-civic-data.js",
+    "import:committees": "node db/import-committees.js",
     "build:civic-snapshots": "node db/build-civic-snapshots.js",
     "transcribe": "node ingestion/transcribe.js",
     "ingest:list": "node ingestion/list.js",

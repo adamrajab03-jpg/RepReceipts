@@ -1,0 +1,247 @@
+[
+  {
+    "thomas_id": "HLIG",
+    "name": "House Permanent Select Committee on Intelligence",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSAG",
+    "name": "House Committee on Agriculture",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSAP",
+    "name": "House Committee on Appropriations",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSAS",
+    "name": "House Committee on Armed Services",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSBA",
+    "name": "House Committee on Financial Services",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSBU",
+    "name": "House Committee on the Budget",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSED",
+    "name": "House Committee on Education and Workforce",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSFA",
+    "name": "House Committee on Foreign Affairs",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSGO",
+    "name": "House Committee on Oversight and Government Reform",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSHA",
+    "name": "House Committee on House Administration",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSHM",
+    "name": "House Committee on Homeland Security",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSIF",
+    "name": "House Committee on Energy and Commerce",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSII",
+    "name": "House Committee on Natural Resources",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSJU",
+    "name": "House Committee on the Judiciary",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSPW",
+    "name": "House Committee on Transportation and Infrastructure",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSQJ",
+    "name": "House Select Subcommittee to Investigate the Remaining Questions Surrounding January 6, 2021",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSRU",
+    "name": "House Committee on Rules",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSSM",
+    "name": "House Committee on Small Business",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSSO",
+    "name": "House Committee on Ethics",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSSY",
+    "name": "House Committee on Science, Space, and Technology",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSVR",
+    "name": "House Committee on Veterans' Affairs",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSWM",
+    "name": "House Committee on Ways and Means",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "HSZS",
+    "name": "House Select Committee on the Strategic Competition Between the United States and the Chinese Communist Party",
+    "chamber": "house"
+  },
+  {
+    "thomas_id": "JCSE",
+    "name": "Commission on Security and Cooperation in Europe",
+    "chamber": "joint"
+  },
+  {
+    "thomas_id": "JSEC",
+    "name": "Joint Economic Committee",
+    "chamber": "joint"
+  },
+  {
+    "thomas_id": "JSLC",
+    "name": "Joint Committee of Congress on the Library",
+    "chamber": "joint"
+  },
+  {
+    "thomas_id": "JSPR",
+    "name": "Joint Committee on Printing",
+    "chamber": "joint"
+  },
+  {
+    "thomas_id": "JSTX",
+    "name": "Joint Committee on Taxation",
+    "chamber": "joint"
+  },
+  {
+    "thomas_id": "SCNC",
+    "name": "United States Senate Caucus on International Narcotics Control",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SLET",
+    "name": "Senate Select Committee on Ethics",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SLIA",
+    "name": "Senate Committee on Indian Affairs",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SLIN",
+    "name": "Senate Select Committee on Intelligence",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SPAG",
+    "name": "Senate Special Committee on Aging",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSAF",
+    "name": "Senate Committee on Agriculture, Nutrition, and Forestry",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSAP",
+    "name": "Senate Committee on Appropriations",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSAS",
+    "name": "Senate Committee on Armed Services",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSBK",
+    "name": "Senate Committee on Banking, Housing, and Urban Affairs",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSBU",
+    "name": "Senate Committee on the Budget",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSCM",
+    "name": "Senate Committee on Commerce, Science, and Transportation",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSEG",
+    "name": "Senate Committee on Energy and Natural Resources",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSEV",
+    "name": "Senate Committee on Environment and Public Works",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSFI",
+    "name": "Senate Committee on Finance",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSFR",
+    "name": "Senate Committee on Foreign Relations",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSGA",
+    "name": "Senate Committee on Homeland Security and Governmental Affairs",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSHR",
+    "name": "Senate Committee on Health, Education, Labor, and Pensions",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSJU",
+    "name": "Senate Committee on the Judiciary",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSRA",
+    "name": "Senate Committee on Rules and Administration",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSSB",
+    "name": "Senate Committee on Small Business and Entrepreneurship",
+    "chamber": "senate"
+  },
+  {
+    "thomas_id": "SSVA",
+    "name": "Senate Committee on Veterans' Affairs",
+    "chamber": "senate"
+  }
+]

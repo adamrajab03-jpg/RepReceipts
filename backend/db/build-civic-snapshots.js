@@ -1,18 +1,33 @@
 /**
  * build-civic-snapshots.js — regenerate the committed civic-data snapshots.
  *
- * Transforms the two raw upstream datasets (kept in db/data/raw/, gitignored)
- * into slim, purpose-built snapshots that ARE committed and that the importer
- * (import-civic-data.js) loads into Postgres:
+ * Transforms the raw upstream datasets (kept in db/data/raw/, gitignored)
+ * into slim, purpose-built snapshots that ARE committed and that the importers
+ * (import-civic-data.js, import-committees.js) load into Postgres:
  *
- *   db/data/legislators-current.json   slim: bioguide, name, party, chamber, state, district
- *   db/data/zip-districts.csv          slim: zip, state, district  (one row per ZIP×district)
+ *   db/data/legislators-current.json     slim: bioguide, name, party, chamber, state, district
+ *   db/data/zip-districts.csv            slim: zip, state, district  (one row per ZIP×district)
+ *   db/data/committees-current.json      slim: thomas_id, name, chamber  (top-level committees)
+ *   db/data/committee-memberships.json   slim: thomas_id, name, members[{ bioguide, name, role }]
  *
  * ── Sources (download into db/data/raw/ before running; see db/data/README.md) ──
  *   legislators-current.yaml
  *     https://raw.githubusercontent.com/unitedstates/congress-legislators/main/legislators-current.yaml
  *     Canonical civic-tech roster. The LAST entry in each member's `terms[]` is
  *     their current seat (type sen/rep, state, district, party).
+ *
+ *   committees-current.yaml
+ *     https://raw.githubusercontent.com/unitedstates/congress-legislators/main/committees-current.yaml
+ *     Current standing committees. Each top-level entry has `type` (house/senate/
+ *     joint), `name`, and a stable `thomas_id` (e.g. SSCM = Senate Commerce);
+ *     `subcommittees[]` are nested (deferred — we snapshot top-level only).
+ *
+ *   committee-membership-current.yaml
+ *     https://raw.githubusercontent.com/unitedstates/congress-legislators/main/committee-membership-current.yaml
+ *     A map keyed by committee thomas_id → member list. Each member carries a
+ *     `bioguide`, a `party` (majority/minority — NOT D/R), and an optional
+ *     `title` (Chair / Ranking Member). Subcommittee keys (parent+2 digits, e.g.
+ *     SSCM16) are dropped; we keep only top-level committee rosters.
  *
  *   tab20_cd11820_zcta520_natl.txt
  *     https://www2.census.gov/geo/docs/maps-data/data/rel2020/cd-sld/tab20_cd11820_zcta520_natl.txt
@@ -133,8 +148,55 @@ function buildZipDistricts() {
   return rows;
 }
 
+// ── 3. Committees YAML → slim JSON (top-level committees only) ────────────────
+function buildCommittees() {
+  const src = yaml.load(fs.readFileSync(path.join(RAW, 'committees-current.yaml'), 'utf8'));
+  const CHAMBER = { house: 'house', senate: 'senate', joint: 'joint' };
+  const out = [];
+  for (const c of src) {
+    if (!c.thomas_id) continue;                          // top-level committees always have one
+    const chamber = CHAMBER[c.type];
+    if (!chamber) continue;                              // skip anything unexpected
+    out.push({ thomas_id: c.thomas_id, name: c.name, chamber });
+  }
+  out.sort((a, b) => a.thomas_id.localeCompare(b.thomas_id));
+  fs.writeFileSync(path.join(OUT, 'committees-current.json'), JSON.stringify(out, null, 2) + '\n');
+  return out;
+}
+
+// Collapse the upstream free-text `title` into our committee_memberships.role
+// CHECK ('chair' | 'ranking_member' | 'member'). Vice Chairs and untitled rank-
+// and-file members map to plain 'member'.
+function membershipRole(title) {
+  if (!title) return 'member';
+  if (/ranking/i.test(title)) return 'ranking_member';
+  if (/chair/i.test(title) && !/vice/i.test(title)) return 'chair';
+  return 'member';
+}
+
+// ── 4. Committee membership YAML → slim JSON (top-level rosters only) ─────────
+function buildCommitteeMemberships(committees) {
+  const src = yaml.load(fs.readFileSync(path.join(RAW, 'committee-membership-current.yaml'), 'utf8'));
+  const byId = new Map(committees.map(c => [c.thomas_id, c.name]));
+  const out = [];
+  for (const [thomasId, roster] of Object.entries(src)) {
+    if (!byId.has(thomasId)) continue;                   // drops subcommittee keys (e.g. SSCM16)
+    const members = (roster || []).map(m => ({
+      bioguide: m.bioguide,
+      name:     m.name,                                  // committed for human eyeball-verification
+      role:     membershipRole(m.title),
+    }));
+    out.push({ thomas_id: thomasId, name: byId.get(thomasId), members });
+  }
+  out.sort((a, b) => a.thomas_id.localeCompare(b.thomas_id));
+  fs.writeFileSync(path.join(OUT, 'committee-memberships.json'), JSON.stringify(out, null, 2) + '\n');
+  return out;
+}
+
 const legislators = buildLegislators();
 const zipRows = buildZipDistricts();
+const committees = buildCommittees();
+const memberships = buildCommitteeMemberships(committees);
 
 const senators = legislators.filter(l => l.chamber === 'senate').length;
 const reps     = legislators.filter(l => l.chamber === 'house').length;
@@ -142,6 +204,10 @@ const splitZips = new Set();
 const seen = new Set();
 for (const r of zipRows) { if (seen.has(r.zip)) splitZips.add(r.zip); seen.add(r.zip); }
 
+const memberSeats = memberships.reduce((s, c) => s + c.members.length, 0);
+
 console.log('Snapshots written to db/data/:');
-console.log(`  legislators-current.json  ${legislators.length} members (${senators} senate, ${reps} house)`);
-console.log(`  zip-districts.csv         ${zipRows.length} rows, ${seen.size} unique ZIPs (${splitZips.size} split across districts)`);
+console.log(`  legislators-current.json    ${legislators.length} members (${senators} senate, ${reps} house)`);
+console.log(`  zip-districts.csv           ${zipRows.length} rows, ${seen.size} unique ZIPs (${splitZips.size} split across districts)`);
+console.log(`  committees-current.json     ${committees.length} top-level committees`);
+console.log(`  committee-memberships.json  ${memberships.length} committees, ${memberSeats} member seats`);
