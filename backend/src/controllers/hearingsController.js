@@ -126,7 +126,8 @@ async function getHearingTranscript(req, res) {
 
     const { rows: turns } = await db.query(`
       SELECT
-        st.id, st.seq, st.member_id, st.speaker_name, st.speaker_role,
+        st.id, st.seq, st.member_id, st.speaker_label_raw,
+        st.speaker_name, st.speaker_role,
         st.start_ms, st.end_ms, st.attribution_status,
         st.raw_text, st.clean_text, st.word_times, st.is_edited,
         m.full_name AS member_full_name, m.bioguide_id,

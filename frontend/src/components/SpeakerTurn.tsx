@@ -86,7 +86,12 @@ export default function SpeakerTurn({ turn, index }: { turn: Turn; index: number
   const [quoteState, setQuoteState] = useState<QuoteState>({ phase: 'idle' })
   const [showComments, setShowComments] = useState(false)
 
-  const displayName = turn.member_full_name ?? turn.speaker_name ?? 'Unknown Speaker'
+  // Fall back through: attributed member → witness/non-member name → Deepgram's
+  // raw diarization label ("Speaker 2") → last-resort. Without speaker_label_raw
+  // every un-attributed batch turn would render "Unknown Speaker", hiding the
+  // diarization entirely.
+  const displayName =
+    turn.member_full_name ?? turn.speaker_name ?? turn.speaker_label_raw ?? 'Unknown Speaker'
   const text        = turn.clean_text ?? turn.raw_text
   const tokens      = tokenize(turn)
   const hasWordTimes = !!turn.word_times?.length

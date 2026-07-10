@@ -1,0 +1,5 @@
+# Deepgram realtime code ported here from a separate project for reference while
+# building the batch pipeline. It is NOT part of Rep-Receipts and must not be
+# committed. Everything in this folder is ignored except this file.
+*
+!.gitignore

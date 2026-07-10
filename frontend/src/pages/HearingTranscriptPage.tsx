@@ -7,8 +7,10 @@ import { cn } from '../utils/cn'
 const STATUS_STYLES: Record<string, string> = {
   scheduled:  'bg-yellow-100 text-yellow-700',
   live:       'bg-green-100 text-green-700',
-  processing: 'bg-blue-100 text-blue-700',
-  published:  'bg-slate-100 text-slate-600',
+  processing:   'bg-blue-100 text-blue-700',
+  transcribing: 'bg-blue-100 text-blue-700',
+  draft:        'bg-amber-100 text-amber-700',
+  published:    'bg-slate-100 text-slate-600',
 }
 
 function fmtDate(iso: string | null) {
@@ -50,6 +52,16 @@ export default function HearingTranscriptPage() {
           {hearing.congress       && <span>{hearing.congress}th Congress</span>}
         </div>
       </div>
+
+      {/* Draft notice — speakers are auto-diarized ("Speaker N"), not yet
+          attributed to real members. */}
+      {hearing.status === 'draft' && (
+        <div className="bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-lg px-4 py-3 mb-6">
+          <span className="font-semibold">Draft transcript.</span>{' '}
+          Speakers are auto-diarized from the audio and not yet attributed to members —
+          labels below (“Speaker 1”, “Speaker 2”…) are raw diarization output.
+        </div>
+      )}
 
       {/* Transcript */}
       {!transcript ? (

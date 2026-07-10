@@ -10,7 +10,10 @@
     "migrate": "node db/migrate.js",
     "seed": "node db/seeds/seed.js",
     "import:civic": "node db/import-civic-data.js",
-    "build:civic-snapshots": "node db/build-civic-snapshots.js"
+    "build:civic-snapshots": "node db/build-civic-snapshots.js",
+    "transcribe": "node ingestion/transcribe.js",
+    "ingest:list": "node ingestion/list.js",
+    "ingest:delete": "node ingestion/delete.js"
   },
   "devDependencies": {
     "js-yaml": "^4.2.0",

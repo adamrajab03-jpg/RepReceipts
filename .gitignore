@@ -38,3 +38,12 @@ coverage/
 # Uploads / temp
 uploads/
 tmp/
+
+# Deepgram artifact cache (content-addressed, regenerable)
+backend/ingestion/artifacts/
+
+# Local sample/test audio (large, not for version control)
+backend/ingestion/*.mp3
+backend/ingestion/*.webm
+backend/ingestion/*.wav
+backend/ingestion/*.m4a

@@ -29,7 +29,7 @@ export interface Hearing {
   title: string
   congress: number | null
   held_on: string | null
-  status: 'scheduled' | 'live' | 'processing' | 'published'
+  status: 'scheduled' | 'live' | 'processing' | 'published' | 'transcribing' | 'draft'
   video_url: string | null
   video_source: string | null
   official_url: string | null
@@ -43,6 +43,7 @@ export interface WordTime {
   w: string
   s: number
   e: number
+  c?: number   // per-word ASR confidence (0–1); present for deepgram_batch turns
 }
 
 export interface Topic {
@@ -100,6 +101,7 @@ export interface SpeakerTurn {
   id: string
   seq: number
   member_id: string | null
+  speaker_label_raw: string | null
   speaker_name: string | null
   speaker_role: 'chair' | 'member' | 'witness' | 'staff' | 'unknown' | null
   start_ms: number | null
