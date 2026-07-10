@@ -8,20 +8,24 @@
 //                                 [--new]
 //
 //  What it does:
-//    1. If --video-url matches an existing hearing, reuses that hearing (wipes
-//       its prior deepgram_batch transcript + speaker_turns, leaves any
-//       gpo_official transcript alone) instead of creating a duplicate. Pass
+//    1. If --video-url matches an existing hearing, that hearing is reused —
+//       but its prior deepgram_batch transcript + speaker_turns are NOT
+//       touched until a full replacement is in hand. The fetch (or cache hit)
+//       happens first; the wipe-and-replace only happens inside the same
+//       commit as the new data. If the fetch fails, the old transcript and
+//       hearing status are byte-for-byte as they were before the run. Pass
 //       --new to force a fresh hearing row even on a video_url match.
-//       Otherwise creates a hearing (status 'transcribing', committee_id NULL)
-//       and a transcript (source 'deepgram_batch', status 'processing') up
-//       front, so the record is visible while the — potentially slow — API
-//       call runs.
+//       For a brand-new hearing (no match), a shell row is created up front
+//       (status 'transcribing', committee_id NULL) so it's visible while the
+//       — potentially slow — API call runs; there's no prior data to lose there.
 //    2. Sends the source to Deepgram Nova-3 pre-recorded with diarization —
 //       unless a cached response for this exact audio already exists on disk
 //       (backend/ingestion/artifacts/), in which case it's reused for $0.
-//    3. Groups the diarized words into speaker turns and inserts them.
-//    4. Flips the transcript to 'complete' and the hearing to 'draft'
-//       (auto-diarized, awaiting speaker attribution).
+//    3. Groups the diarized words into speaker turns.
+//    4. Only now, in one transaction: wipe the old deepgram_batch transcript
+//       (reuse case only), insert the new transcript (status 'complete') and
+//       its turns, and flip the hearing to 'draft' (auto-diarized, awaiting
+//       speaker attribution).
 //
 //  Attribution — mapping "Speaker N" to real members, a real committee, and a
 //  video source — is the next slice, not this one.
@@ -36,7 +40,7 @@ const {
   groupWordsIntoTurns,
   NOVA3_PRERECORDED_USD_PER_MIN,
 } = require('./deepgram');
-const { readCache, writeCache } = require('./artifactCache');
+const { readCache, writeCache, cachePath } = require('./artifactCache');
 
 // ── Arg parsing ─────────────────────────────────────────────────────────────
 const BOOLEAN_FLAGS = new Set(['new']);
@@ -92,40 +96,31 @@ async function main() {
   const client = await pool.connect();
 
   let hearingId;
-  let transcriptId;
   let reused = false;
   try {
-    await client.query('BEGIN');
     const heldOn = opts['held-on'] || null;
     const videoUrl = opts['video-url'] || null;
     const videoSource = videoUrl ? 'other' : null;
     const forceNew = opts.new === true;
 
-    let existing = null;
+    // 1a. Dedup lookup is READ-ONLY — no mutation until new data is in hand.
+    let existingId = null;
     if (videoUrl && !forceNew) {
       const existingRes = await client.query(
         `SELECT id FROM hearings WHERE video_url = $1`,
         [videoUrl]
       );
-      existing = existingRes.rows[0] || null;
+      existingId = existingRes.rows[0]?.id ?? null;
     }
 
-    if (existing) {
-      hearingId = existing.id;
+    if (existingId) {
+      hearingId = existingId;
       reused = true;
-      await client.query(
-        `UPDATE hearings SET title = $2, held_on = $3, video_source = $4, status = 'transcribing'
-         WHERE id = $1`,
-        [hearingId, title, heldOn, videoSource]
-      );
-      // Only this pipeline's prior transcript is wiped — a gpo_official
-      // transcript on the same hearing, if any, is left untouched. Cascades
-      // to its speaker_turns via transcripts -> speaker_turns ON DELETE CASCADE.
-      await client.query(
-        `DELETE FROM transcripts WHERE hearing_id = $1 AND source = 'deepgram_batch'`,
-        [hearingId]
-      );
+      console.log(`Found existing hearing ${hearingId} for this --video-url. Fetching before touching it…`);
     } else {
+      // Nothing pre-existing is at risk, so it's safe to create the shell row
+      // up front for visibility while the (potentially slow) API call runs.
+      await client.query('BEGIN');
       const hearingRes = await client.query(
         `INSERT INTO hearings (committee_id, title, held_on, video_url, video_source, status)
          VALUES (NULL, $1, $2, $3, $4, 'transcribing')
@@ -133,32 +128,26 @@ async function main() {
         [title, heldOn, videoUrl, videoSource]
       );
       hearingId = hearingRes.rows[0].id;
+      await client.query('COMMIT');
+      console.log(`Created hearing ${hearingId} (status: transcribing)`);
     }
 
-    const txRes = await client.query(
-      `INSERT INTO transcripts (hearing_id, source, is_primary, status)
-       VALUES ($1, 'deepgram_batch', true, 'processing')
-       RETURNING id`,
-      [hearingId]
-    );
-    transcriptId = txRes.rows[0].id;
-    await client.query('COMMIT');
-
-    console.log(reused
-      ? `Reusing hearing ${hearingId} (matched --video-url; previous deepgram_batch transcript wiped)`
-      : `Created hearing ${hearingId} (status: transcribing)`);
-
-    // 2. Deepgram call (or cache hit), timed.
+    // 2. Deepgram call (or cache hit), timed. Still zero destructive DB writes.
     const startedAt = Date.now();
     let result;
     const cached = readCache(sourceKey);
     if (cached) {
       result = cached.result;
-      console.log(`Cache hit for this audio (${sourceKey.slice(0, 12)}…) — reusing saved Deepgram response, $0.`);
+      console.log(`Cache hit for this audio (${sourceKey.slice(0, 12)}…) — reusing, $0.`);
     } else {
-      console.log(`Sending "${source}" to Deepgram Nova-3 (batch, diarized)…`);
+      console.log(`Cache miss — calling Deepgram for "${source}" (Nova-3, batch, diarized)…`);
       result = await transcribeSource(loaded, apiKey);
-      writeCache(sourceKey, { source, fetchedAt: new Date().toISOString(), result });
+      try {
+        writeCache(sourceKey, { source, fetchedAt: new Date().toISOString(), result });
+        console.log(`Cached Deepgram response at ${cachePath(sourceKey)}`);
+      } catch (cacheErr) {
+        console.error(`Warning: failed to write Deepgram cache (${cacheErr.message}) — continuing without it.`);
+      }
     }
     const elapsedSec = (Date.now() - startedAt) / 1000;
 
@@ -169,8 +158,34 @@ async function main() {
     const turns = groupWordsIntoTurns(alt.words ?? []);
     if (!turns.length) throw new Error('No words returned — nothing to insert.');
 
-    // 3. Insert turns + finalize, in one transaction.
+    // 3. New data is fully in hand and validated. Only now does the
+    //    destructive part happen, atomically: wipe (reuse case only), insert,
+    //    finalize. If anything below throws, the ROLLBACK restores the wiped
+    //    transcript along with everything else — the hearing ends up exactly
+    //    as it was before this run started.
     await client.query('BEGIN');
+    if (reused) {
+      await client.query(
+        `UPDATE hearings SET title = $2, held_on = $3, video_source = $4 WHERE id = $1`,
+        [hearingId, title, heldOn, videoSource]
+      );
+      // Only this pipeline's prior transcript is wiped — a gpo_official
+      // transcript on the same hearing, if any, is left untouched. Cascades
+      // to its speaker_turns via transcripts -> speaker_turns ON DELETE CASCADE.
+      await client.query(
+        `DELETE FROM transcripts WHERE hearing_id = $1 AND source = 'deepgram_batch'`,
+        [hearingId]
+      );
+    }
+
+    const txRes = await client.query(
+      `INSERT INTO transcripts (hearing_id, source, is_primary, status)
+       VALUES ($1, 'deepgram_batch', true, 'complete')
+       RETURNING id`,
+      [hearingId]
+    );
+    const transcriptId = txRes.rows[0].id;
+
     for (let i = 0; i < turns.length; i++) {
       const t = turns[i];
       await client.query(
@@ -190,9 +205,12 @@ async function main() {
         ]
       );
     }
-    await client.query(`UPDATE transcripts SET status = 'complete' WHERE id = $1`, [transcriptId]);
     await client.query(`UPDATE hearings SET status = 'draft' WHERE id = $1`, [hearingId]);
     await client.query('COMMIT');
+
+    console.log(reused
+      ? `Reusing hearing ${hearingId} (previous deepgram_batch transcript replaced)`
+      : `Finalized hearing ${hearingId}`);
 
     // 4. Summary + cost/time estimate.
     const speakers = new Set(turns.map((t) => t.speakerLabelRaw)).size;
@@ -208,12 +226,15 @@ async function main() {
     console.log('');
     console.log(`  View: /hearings/${hearingId}`);
   } catch (err) {
-    // Best-effort: roll back the current statement's txn. The hearing, if it was
-    // created, is left in 'transcribing' to signal the run did not finish.
+    // Best-effort rollback of whichever transaction was open.
     await client.query('ROLLBACK').catch(() => {});
     console.error('');
     console.error('Transcription failed:', err.message);
-    if (hearingId) console.error(`Hearing ${hearingId} left with status 'transcribing'.`);
+    if (hearingId && !reused) {
+      console.error(`Hearing ${hearingId} left with status 'transcribing' (new hearing; no prior data lost).`);
+    } else if (hearingId && reused) {
+      console.error(`Hearing ${hearingId} left untouched — existing transcript preserved.`);
+    }
     process.exitCode = 1;
   } finally {
     client.release();

@@ -27,4 +27,4 @@ function writeCache(sourceKey, data) {
   fs.writeFileSync(cachePath(sourceKey), JSON.stringify(data, null, 2));
 }
 
-module.exports = { readCache, writeCache };
+module.exports = { readCache, writeCache, cachePath };
