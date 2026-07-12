@@ -1,0 +1,31 @@
+-- ============================================================================
+--  Speaker-turn suggestions (LLM attribution / topic proposals)
+-- ----------------------------------------------------------------------------
+--  Adds speaker_turns.suggestions — a JSONB bag of *proposed*, not-yet-applied
+--  machine output. Nothing here is authoritative: the confirmed record stays in
+--  member_id / speaker_name / speaker_role / attribution_status, which only the
+--  (future) admin-review flow writes. The attribution slice writes ONLY the
+--  `attribution` key; topic suggestions can later live under `topics` in the
+--  same column without collision.
+--
+--  Shape written under `attribution` (per distinct Deepgram speaker, applied to
+--  all of that speaker's turns):
+--    {
+--      "attribution": {
+--        "suggested_identity": {
+--          "type": "member" | "witness" | "unknown",
+--          "member_id": "<uuid|null>",     -- resolved in code from bioguide_id
+--          "bioguide_id": "<str|null>",
+--          "display_name": "<str|null>"
+--        },
+--        "confidence": 0.0,                 -- 0..1
+--        "reasoning": "…cue…",
+--        "provider": "anthropic",
+--        "model": "claude-sonnet-5",
+--        "speaker_label_raw": "Speaker 3",
+--        "generated_at": "<ISO8601>"
+--      }
+--    }
+-- ============================================================================
+
+ALTER TABLE speaker_turns ADD COLUMN IF NOT EXISTS suggestions jsonb NOT NULL DEFAULT '{}';

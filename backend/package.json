@@ -14,13 +14,15 @@
     "build:civic-snapshots": "node db/build-civic-snapshots.js",
     "transcribe": "node ingestion/transcribe.js",
     "ingest:list": "node ingestion/list.js",
-    "ingest:delete": "node ingestion/delete.js"
+    "ingest:delete": "node ingestion/delete.js",
+    "attribute": "node ingestion/attribute.js"
   },
   "devDependencies": {
     "js-yaml": "^4.2.0",
     "kill-port": "^2.0.1"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.111.0",
     "argon2": "^0.44.0",
     "bcryptjs": "^3.0.3",
     "cookie-parser": "^1.4.7",
