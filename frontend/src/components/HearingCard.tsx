@@ -1,15 +1,7 @@
 import { Link } from 'react-router-dom'
 import type { Hearing } from '../types/api'
+import { tierBadge } from '../utils/hearingTier'
 import { cn } from '../utils/cn'
-
-const statusStyles: Record<string, string> = {
-  scheduled:  'bg-yellow-100 text-yellow-700',
-  live:       'bg-green-100 text-green-700',
-  processing:   'bg-blue-100 text-blue-700',
-  transcribing: 'bg-blue-100 text-blue-700',
-  draft:        'bg-amber-100 text-amber-700',
-  published:    'bg-slate-100 text-slate-600',
-}
 
 function fmtDate(iso: string | null) {
   if (!iso) return null
@@ -17,6 +9,7 @@ function fmtDate(iso: string | null) {
 }
 
 export default function HearingCard({ hearing: h }: { hearing: Hearing }) {
+  const badge = tierBadge(h.status)
   return (
     <Link
       to={`/hearings/${h.id}`}
@@ -24,9 +17,8 @@ export default function HearingCard({ hearing: h }: { hearing: Hearing }) {
     >
       <div className="flex items-start justify-between gap-3">
         <h3 className="font-semibold text-gray-900 text-sm leading-snug">{h.title}</h3>
-        <span className={cn('text-xs font-medium px-2 py-0.5 rounded-full shrink-0 capitalize',
-          statusStyles[h.status] ?? statusStyles.published)}>
-          {h.status}
+        <span className={cn('text-xs font-medium px-2 py-0.5 rounded-full shrink-0', badge.cls)}>
+          {badge.label}
         </span>
       </div>
       {h.committee_name && (

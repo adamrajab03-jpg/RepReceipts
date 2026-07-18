@@ -58,6 +58,18 @@ export default function Layout() {
             </NavLink>
           )}
 
+          {user?.is_admin && (
+            <NavLink
+              to="/admin"
+              className={({ isActive }) =>
+                cn('text-sm font-medium transition-colors hover:text-white',
+                  isActive ? 'text-amber-300' : 'text-amber-400/70')
+              }
+            >
+              Admin
+            </NavLink>
+          )}
+
           <div className="ml-auto flex items-center gap-4">
             {/* Compact ZIP search on every page except the homepage (which has the hero). */}
             {pathname !== '/' && <ZipSearch />}

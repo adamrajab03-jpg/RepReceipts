@@ -2,16 +2,8 @@ import { Link, useParams } from 'react-router-dom'
 import { useHearingTranscript } from '../hooks/useHearingTranscript'
 import TranscriptView from '../components/TranscriptView'
 import CommentThread from '../components/CommentThread'
+import { tierBadge, tierBanner } from '../utils/hearingTier'
 import { cn } from '../utils/cn'
-
-const STATUS_STYLES: Record<string, string> = {
-  scheduled:  'bg-yellow-100 text-yellow-700',
-  live:       'bg-green-100 text-green-700',
-  processing:   'bg-blue-100 text-blue-700',
-  transcribing: 'bg-blue-100 text-blue-700',
-  draft:        'bg-amber-100 text-amber-700',
-  published:    'bg-slate-100 text-slate-600',
-}
 
 function fmtDate(iso: string | null) {
   if (!iso) return null
@@ -28,6 +20,8 @@ export default function HearingTranscriptPage() {
   if (isError || !data) return <p className="text-sm text-red-500">Hearing not found.</p>
 
   const { hearing, transcript } = data.data
+  const badge = tierBadge(hearing.status)
+  const banner = tierBanner(hearing.status)
 
   return (
     <div>
@@ -39,11 +33,8 @@ export default function HearingTranscriptPage() {
       <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
         <div className="flex items-start justify-between gap-4">
           <h1 className="text-xl font-bold text-gray-900 leading-snug">{hearing.title}</h1>
-          <span className={cn(
-            'text-xs font-medium px-2 py-1 rounded-full shrink-0 capitalize',
-            STATUS_STYLES[hearing.status] ?? STATUS_STYLES.published
-          )}>
-            {hearing.status}
+          <span className={cn('text-xs font-medium px-2 py-1 rounded-full shrink-0', badge.cls)}>
+            {badge.label}
           </span>
         </div>
         <div className="flex flex-wrap gap-x-4 gap-y-1 mt-3 text-sm text-gray-500">
@@ -53,13 +44,15 @@ export default function HearingTranscriptPage() {
         </div>
       </div>
 
-      {/* Draft notice — speakers are auto-diarized ("Speaker N"), not yet
-          attributed to real members. */}
-      {hearing.status === 'draft' && (
-        <div className="bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-lg px-4 py-3 mb-6">
-          <span className="font-semibold">Draft transcript.</span>{' '}
-          Speakers are auto-diarized from the audio and not yet attributed to members —
-          labels below (“Speaker 1”, “Speaker 2”…) are raw diarization output.
+      {/* Trust-tier banner — the reader-facing signal above the quotes.
+          draft (raw) · attributed (AI-assisted) · verified (human-verified). */}
+      {banner && (
+        <div className={cn('border text-sm rounded-lg px-4 py-3 mb-6 flex items-start gap-3', banner.cls)}>
+          <span className="text-lg leading-none shrink-0" aria-hidden>{banner.icon}</span>
+          <span>
+            <span className="font-semibold">{banner.title}.</span>{' '}
+            {banner.body}
+          </span>
         </div>
       )}
 

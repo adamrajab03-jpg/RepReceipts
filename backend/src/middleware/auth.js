@@ -83,4 +83,25 @@ function optionalAuth(req, _res, next) {
   return next();
 }
 
-module.exports = { requireAuth, optionalAuth };
+// Admin gate: run requireAuth first (sets req.user, handles refresh), then
+// confirm the account is an admin. is_admin is NOT in the JWT, so this is a
+// fresh DB lookup — granting/revoking admin therefore takes effect immediately,
+// not on next token refresh. requireAuth sends its own 401 on failure and never
+// invokes the callback in that case, so the check below only runs when authed.
+function requireAdmin(req, res, next) {
+  requireAuth(req, res, async () => {
+    try {
+      const { rows } = await db.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
+      if (!rows.length || !rows[0].is_admin) {
+        return res.status(403).json({ error: 'Admin access required' });
+      }
+      req.user.is_admin = true;
+      return next();
+    } catch (err) {
+      console.error('requireAdmin error:', err);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+}
+
+module.exports = { requireAuth, optionalAuth, requireAdmin };

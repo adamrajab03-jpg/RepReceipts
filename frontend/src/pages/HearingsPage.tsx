@@ -8,10 +8,10 @@ import FollowButton from '../components/FollowButton'
 import type { Hearing } from '../types/api'
 
 const STATUSES = [
-  { label: 'All',       value: '' },
-  { label: 'Published', value: 'published' },
-  { label: 'Scheduled', value: 'scheduled' },
-  { label: 'Live',      value: 'live' },
+  { label: 'All',            value: '' },
+  { label: 'Scheduled',      value: 'scheduled' },
+  { label: 'AI-attributed',  value: 'attributed' },
+  { label: 'Human-verified', value: 'verified' },
 ]
 
 type CommitteeGroup = {
@@ -66,7 +66,7 @@ export default function HearingsPage() {
 
   const groups = useMemo(() => groupByCommittee(data?.data ?? []), [data])
   // Whether we're locked to one status bucket (don't need subsection labels)
-  const singleStatus = status === 'scheduled' || status === 'live' || status === 'published' || status === 'processing'
+  const singleStatus = status === 'scheduled' || status === 'live' || status === 'published' || status === 'processing' || status === 'attributed' || status === 'verified'
 
   return (
     <div>
@@ -167,11 +167,11 @@ export default function HearingsPage() {
                         </div>
                       </div>
                     )}
-                    {/* Published (past) second */}
+                    {/* Past hearings second */}
                     {g.published.length > 0 && (
                       <div>
                         {!singleStatus && g.scheduled.length > 0 && (
-                          <p className="text-xs uppercase tracking-wide text-gray-400 mb-2">Published</p>
+                          <p className="text-xs uppercase tracking-wide text-gray-400 mb-2">Past hearings</p>
                         )}
                         <div className="space-y-3">
                           {g.published.map(h => <HearingCard key={h.id} hearing={h} />)}

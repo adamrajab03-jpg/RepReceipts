@@ -29,7 +29,7 @@ export interface Hearing {
   title: string
   congress: number | null
   held_on: string | null
-  status: 'scheduled' | 'live' | 'processing' | 'published' | 'transcribing' | 'draft'
+  status: 'scheduled' | 'live' | 'processing' | 'published' | 'transcribing' | 'draft' | 'attributed' | 'verified'
   video_url: string | null
   video_source: string | null
   official_url: string | null
@@ -106,7 +106,7 @@ export interface SpeakerTurn {
   speaker_role: 'chair' | 'member' | 'witness' | 'staff' | 'unknown' | null
   start_ms: number | null
   end_ms: number | null
-  attribution_status: 'auto' | 'verified' | 'unverified' | 'edited'
+  attribution_status: 'auto' | 'verified' | 'unverified' | 'edited' | 'attributed'
   raw_text: string
   clean_text: string | null
   word_times: WordTime[] | null
@@ -219,6 +219,74 @@ export interface RepsLookup {
   districts: { state: string; district: number }[]
   senate: ResolvedRep[]
   house: ResolvedRep[]
+}
+
+// ── Admin: attribution review ───────────────────────────────────────────────
+export interface AttributionSuggestion {
+  suggested_identity: {
+    type: 'member' | 'witness' | 'unknown'
+    member_id: string | null
+    bioguide_id: string | null
+    display_name: string | null
+  }
+  confidence: number
+  reasoning: string
+  provider: string
+  model: string
+  speaker_label_raw: string
+  generated_at: string
+  flags?: string[]
+}
+
+export interface RosterMember {
+  id: string
+  full_name: string
+  party: string | null
+  state: string | null
+  bioguide_id: string | null
+  role: 'chair' | 'ranking_member' | 'member' | null
+}
+
+export interface ReviewTurn {
+  id: string
+  seq: number
+  start_ms: number | null
+  speaker_label_raw: string
+  member_id: string | null
+  speaker_name: string | null
+  speaker_role: string | null
+  attribution_status: 'auto' | 'verified' | 'unverified' | 'edited' | 'attributed'
+  raw_text: string
+  member_full_name: string | null
+  suggestion: AttributionSuggestion | null
+  pinned: boolean
+}
+
+export interface ReviewData {
+  hearing: {
+    id: string
+    title: string
+    status: Hearing['status']
+    held_on: string | null
+    committee_id: string | null
+    committee_name: string | null
+  }
+  transcript_id: string
+  roster: RosterMember[]
+  turns: ReviewTurn[]
+}
+
+export interface AdminHearing {
+  id: string
+  title: string
+  status: Hearing['status']
+  held_on: string | null
+  created_at: string
+  committee_name: string | null
+  turn_count: number
+  speaker_count: number
+  pending_count: number
+  reviewed_count: number
 }
 
 export interface ListResponse<T> {

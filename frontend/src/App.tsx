@@ -11,6 +11,9 @@ import HeatMapPage from './pages/HeatMapPage'
 import FollowingPage from './pages/FollowingPage'
 import LoginPage from './pages/LoginPage'
 import RegisterPage from './pages/RegisterPage'
+import AdminRoute from './components/AdminRoute'
+import AdminDashboardPage from './pages/AdminDashboardPage'
+import ReviewWorkbenchPage from './pages/ReviewWorkbenchPage'
 
 // Fetches /me on mount and syncs result into Zustand auth store
 function AuthInit() {
@@ -34,6 +37,11 @@ export default function App() {
           <Route path="following"   element={<FollowingPage />} />
           <Route path="login"       element={<LoginPage />} />
           <Route path="register"    element={<RegisterPage />} />
+
+          <Route path="admin" element={<AdminRoute />}>
+            <Route index element={<AdminDashboardPage />} />
+            <Route path="hearings/:id/review" element={<ReviewWorkbenchPage />} />
+          </Route>
         </Route>
       </Routes>
     </BrowserRouter>
