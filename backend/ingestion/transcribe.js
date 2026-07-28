@@ -188,11 +188,14 @@ async function main() {
 
     for (let i = 0; i < turns.length; i++) {
       const t = turns[i];
+      // speaker_key starts equal to the raw diarization label; it is the
+      // editable grouping layer the review workbench rewrites, while
+      // speaker_label_raw stays the immutable Deepgram artifact.
       await client.query(
         `INSERT INTO speaker_turns
-           (transcript_id, seq, speaker_label_raw, start_ms, end_ms,
+           (transcript_id, seq, speaker_label_raw, speaker_key, start_ms, end_ms,
             confidence, attribution_status, raw_text, word_times)
-         VALUES ($1, $2, $3, $4, $5, $6, 'unverified', $7, $8::jsonb)`,
+         VALUES ($1, $2, $3, $3, $4, $5, $6, 'unverified', $7, $8::jsonb)`,
         [
           transcriptId,
           i,

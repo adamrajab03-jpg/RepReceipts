@@ -6,6 +6,9 @@ const {
   applySpeaker,
   overrideTurn,
   acceptAll,
+  splitTurn,
+  mergeTurn,
+  insertTurn,
   setStatus,
 } = require('../controllers/adminController');
 
@@ -16,8 +19,11 @@ router.use(requireAdmin);
 
 router.get('/hearings',                    listAdminHearings);
 router.get('/hearings/:id/review',         getReview);
-router.patch('/hearings/:id/speakers',     applySpeaker);   // attribute/correct a whole speaker
-router.patch('/hearings/:id/turns/:turnId', overrideTurn);  // per-turn override (drift) / reset
+router.patch('/hearings/:id/speakers',     applySpeaker);   // attribute/correct a whole speaker bucket
+router.patch('/hearings/:id/turns/:turnId', overrideTurn);  // move ONE turn between buckets / reset
+router.post('/hearings/:id/turns/:turnId/split',  splitTurn);  // cut a turn at a word boundary
+router.post('/hearings/:id/turns/:turnId/merge',  mergeTurn);  // delete-merge into a neighbor
+router.post('/hearings/:id/turns/:turnId/insert', insertTurn); // blank turn before/after
 router.post('/hearings/:id/accept-all',    acceptAll);       // attribute all pending speakers
 router.post('/hearings/:id/status',        setStatus);       // tier: attributed | verified
 

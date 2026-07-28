@@ -1,25 +1,45 @@
+const crypto = require('crypto');
 const db = require('../utils/db');
+const { splitAtWord, splitAtChar, mergeTexts, meanConfidence } = require('../utils/turnText');
 
 // ============================================================================
-//  Admin: attribution review + two-tier publish.
+//  Admin: attribution review, structural editing + two-tier publish.
 // ----------------------------------------------------------------------------
-//  Applies the LLM's per-speaker suggestions (written to
-//  speaker_turns.suggestions.attribution by ingestion/attribute.js) to the
-//  confirmed record — member_id / speaker_name / speaker_role /
-//  attribution_status. Nothing here trusts the client: every applied member is
-//  re-validated against the tracked roster, and accepted-vs-corrected is decided
-//  server-side by comparing the applied identity to the stored suggestion.
+//  SPEAKER BUCKETS — speaker_key is the editable grouping layer; every
+//  speaker-level operation scopes by it. speaker_label_raw is the immutable
+//  Deepgram diarization artifact and is NEVER written here. Per-turn
+//  reassignment MOVES a turn between buckets (rewrites speaker_key + copies the
+//  bucket's identity), so an individual fix is structurally isolated from bulk
+//  actions on the old bucket — no write-guard needed. Bucket identity is kept
+//  uniform: a per-turn identity decision always resolves to a bucket (an
+//  existing one with that exact identity, else a fresh `manual-*` bucket).
 //
-//  Trust tiers live on hearings.status: draft → attributed (AI-assisted,
-//  human-accepted) → verified (human-verified). Editing attributions on a
-//  verified hearing demotes it back to 'attributed' (surfaced to the caller as
-//  `demoted: true`) so we never silently over-claim.
+//  ORDINALS — the displayed "Speaker N" is derived at read time (dense_rank
+//  over each bucket's first appearance by seq) and never stored, so
+//  renumbering after any edit is automatic and cannot drift.
 //
-//  Per-turn overrides (diarization drift) pin the turn with a
-//  suggestions.turn_override marker; every speaker-level write carries
-//  `AND NOT (suggestions ? 'turn_override')`, so an individual fix is never
-//  clobbered by a later bulk action, in either order.
+//  STRUCTURE — split/merge/insert hold a hard no-lost-word invariant: splits
+//  are exact string partitions and merges exact concatenations (see
+//  utils/turnText.js), asserted server-side before commit. word_times arrays
+//  are only sliced/concatenated, never rebuilt. Seq renumbering relies on the
+//  deferrable speaker_turns_transcript_seq_uniq constraint (migration 010).
+//
+//  Trust tiers live on hearings.status: draft → attributed → verified. Any
+//  identity or structural edit on a verified hearing demotes it back to
+//  'attributed' (surfaced as `demoted: true`) so we never silently over-claim.
+//
+//  suggestions jsonb keys per turn:
+//    attribution   — LLM speaker suggestion (written by ingestion/attribute.js)
+//    turn_override — provenance of a per-turn move (badge + reset affordance)
+//    structural    — last structural op on this turn (split/merge/insert),
+//                    incl. the recorded joiner (split) and seam_offset (merge)
 // ============================================================================
+
+const ORDINALS_SQL = `
+  SELECT speaker_key, dense_rank() OVER (ORDER BY min(seq))::int AS speaker_ordinal
+    FROM speaker_turns
+   WHERE transcript_id = $1
+   GROUP BY speaker_key`;
 
 async function primaryTranscriptId(runner, hearingId) {
   const { rows } = await runner.query(
@@ -50,6 +70,17 @@ function roleForMember(committeeRole) {
   return committeeRole === 'chair' ? 'chair' : 'member';
 }
 
+// Validate a member id against the tracked roster; returns its speaker_role or null.
+async function rosterRole(runner, memberId) {
+  const { rows } = await runner.query(
+    `SELECT (SELECT cm.role FROM committee_memberships cm
+              WHERE cm.member_id = m.id ORDER BY cm.congress DESC NULLS LAST LIMIT 1) AS role
+       FROM members m WHERE m.id = $1`,
+    [memberId]
+  );
+  return rows.length ? roleForMember(rows[0].role) : null;
+}
+
 // Accepting the suggestion as-is → 'attributed'; changing it → 'edited'. No
 // suggestion to accept → 'edited' (a purely manual attribution).
 function statusFor(applied, suggestion) {
@@ -65,8 +96,9 @@ function statusFor(applied, suggestion) {
   return 'attributed'; // both unknown
 }
 
-// Apply one identity to every NON-PINNED turn of a speaker label. Caller owns txn.
-async function applyToSpeaker(runner, transcriptId, label, applied, status) {
+// Apply one identity to every turn of a bucket. Bucket membership IS the
+// scoping — moved-in turns follow their new bucket's changes. Caller owns txn.
+async function applyToSpeaker(runner, transcriptId, speakerKey, applied, status) {
   const memberId    = applied.type === 'member'  ? applied.member_id   : null;
   const speakerName = applied.type === 'witness' ? applied.speaker_name : null;
   const role        = applied.type === 'member'  ? applied.role
@@ -75,21 +107,74 @@ async function applyToSpeaker(runner, transcriptId, label, applied, status) {
   const { rowCount } = await runner.query(
     `UPDATE speaker_turns
         SET member_id = $3, speaker_name = $4, speaker_role = $5, attribution_status = $6
-      WHERE transcript_id = $1 AND speaker_label_raw = $2
-        AND NOT (suggestions ? 'turn_override')`,
-    [transcriptId, label, memberId, speakerName, role, status]
+      WHERE transcript_id = $1 AND speaker_key = $2`,
+    [transcriptId, speakerKey, memberId, speakerName, role, status]
   );
   return rowCount;
 }
 
-// Editing attributions on a verified hearing returns it to 'attributed' — the
-// safe under-claiming direction. Returns true when a demotion actually happened.
+// Editing a verified hearing returns it to 'attributed' — the safe
+// under-claiming direction. Returns true when a demotion actually happened.
 async function maybeDemote(runner, hearingId) {
   const { rows } = await runner.query(
     `UPDATE hearings SET status = 'attributed' WHERE id = $1 AND status = 'verified' RETURNING id`,
     [hearingId]
   );
   return rows.length > 0;
+}
+
+// A bucket's current identity, read from its earliest turn (identity is
+// uniform across a bucket by construction). Null when the bucket is empty.
+async function bucketRep(runner, transcriptId, speakerKey) {
+  const { rows } = await runner.query(
+    `SELECT member_id, speaker_name, speaker_role, attribution_status
+       FROM speaker_turns
+      WHERE transcript_id = $1 AND speaker_key = $2
+      ORDER BY seq LIMIT 1`,
+    [transcriptId, speakerKey]
+  );
+  return rows[0] ?? null;
+}
+
+// Joining a pending bucket keeps the turn pending (acceptAll will fill it with
+// the rest of the bucket); joining an identified bucket is a human edit.
+function joinStatus(rep) {
+  return rep.attribution_status === 'unverified' ? 'unverified' : 'edited';
+}
+
+function newSpeakerKey() {
+  return `manual-${crypto.randomBytes(4).toString('hex')}`;
+}
+
+// Resolve a per-turn identity decision to a bucket, keeping bucket identity
+// uniform. Reuses the earliest-appearing bucket that already has this exact
+// identity; 'unknown' and new_speaker always get a fresh bucket (two unknown
+// voices are not the same person).
+async function resolveIdentityBucket(runner, transcriptId, decision, memberId, witnessName, forceNew) {
+  if (!forceNew) {
+    let match = null;
+    if (decision === 'member') {
+      match = await runner.query(
+        `SELECT speaker_key FROM speaker_turns
+          WHERE transcript_id = $1 AND member_id = $2
+          GROUP BY speaker_key ORDER BY min(seq) LIMIT 1`,
+        [transcriptId, memberId]
+      );
+    } else if (decision === 'witness') {
+      match = await runner.query(
+        `SELECT speaker_key FROM speaker_turns
+          WHERE transcript_id = $1 AND speaker_role = 'witness' AND speaker_name = $2
+          GROUP BY speaker_key ORDER BY min(seq) LIMIT 1`,
+        [transcriptId, witnessName]
+      );
+    }
+    if (match?.rows.length) return match.rows[0].speaker_key;
+  }
+  return newSpeakerKey();
+}
+
+function overrideMarker(fields) {
+  return JSON.stringify({ ...fields, at: new Date().toISOString() });
 }
 
 // ── GET /api/admin/hearings ─────────────────────────────────────────────────
@@ -100,8 +185,8 @@ async function listAdminHearings(_req, res) {
         h.id, h.title, h.status, h.held_on, h.created_at,
         c.name AS committee_name,
         count(st.id)::int AS turn_count,
-        count(DISTINCT st.speaker_label_raw)::int AS speaker_count,
-        count(DISTINCT st.speaker_label_raw)
+        count(DISTINCT st.speaker_key)::int AS speaker_count,
+        count(DISTINCT st.speaker_key)
           FILTER (WHERE st.attribution_status = 'unverified')::int AS pending_count
       FROM hearings h
       LEFT JOIN committees c    ON c.id = h.committee_id
@@ -119,8 +204,8 @@ async function listAdminHearings(_req, res) {
 }
 
 // ── GET /api/admin/hearings/:id/review ──────────────────────────────────────
-//  Returns the full chronological transcript (Part A summary is derived from it
-//  client-side, so the two views can't drift) plus the roster.
+//  Full chronological transcript + roster. speaker_ordinal is the derived
+//  "Speaker N" (appearance order of buckets); word_times feed the split UI.
 async function getReview(req, res) {
   try {
     const { rows: hRows } = await db.query(
@@ -137,13 +222,16 @@ async function getReview(req, res) {
 
     const { rows: turns } = await db.query(`
       SELECT
-        st.id, st.seq, st.start_ms, st.speaker_label_raw,
+        st.id, st.seq, st.start_ms, st.speaker_label_raw, st.speaker_key,
+        f.speaker_ordinal,
         st.member_id, st.speaker_name, st.speaker_role, st.attribution_status,
-        st.raw_text,
+        st.raw_text, st.word_times,
         m.full_name AS member_full_name,
         st.suggestions -> 'attribution' AS suggestion,
-        (st.suggestions ? 'turn_override') AS pinned
+        (st.suggestions ? 'turn_override') AS pinned,
+        st.suggestions -> 'structural' AS structural
       FROM speaker_turns st
+      JOIN (${ORDINALS_SQL}) f ON f.speaker_key = st.speaker_key
       LEFT JOIN members m ON m.id = st.member_id
       WHERE st.transcript_id = $1
       ORDER BY st.seq
@@ -159,11 +247,11 @@ async function getReview(req, res) {
 }
 
 // ── PATCH /api/admin/hearings/:id/speakers ──────────────────────────────────
-//  Attribute (or correct) every non-pinned turn of one speaker.
+//  Attribute (or correct) every turn of one bucket.
 async function applySpeaker(req, res) {
-  const { speaker_label_raw, decision, member_id, witness_name } = req.body || {};
-  if (!speaker_label_raw || !['member', 'witness', 'unknown'].includes(decision)) {
-    return res.status(400).json({ error: 'speaker_label_raw and a valid decision (member|witness|unknown) are required' });
+  const { speaker_key, decision, member_id, witness_name } = req.body || {};
+  if (!speaker_key || !['member', 'witness', 'unknown'].includes(decision)) {
+    return res.status(400).json({ error: 'speaker_key and a valid decision (member|witness|unknown) are required' });
   }
 
   const client = await db.connect();
@@ -174,14 +262,9 @@ async function applySpeaker(req, res) {
     let applied;
     if (decision === 'member') {
       if (!member_id) return res.status(400).json({ error: 'member_id is required for a member decision' });
-      const { rows } = await client.query(
-        `SELECT m.id, (SELECT cm.role FROM committee_memberships cm
-                        WHERE cm.member_id = m.id ORDER BY cm.congress DESC NULLS LAST LIMIT 1) AS role
-           FROM members m WHERE m.id = $1`,
-        [member_id]
-      );
-      if (!rows.length) return res.status(400).json({ error: 'member_id is not a tracked roster member' });
-      applied = { type: 'member', member_id, role: roleForMember(rows[0].role) };
+      const role = await rosterRole(client, member_id);
+      if (!role) return res.status(400).json({ error: 'member_id is not a tracked roster member' });
+      applied = { type: 'member', member_id, role };
     } else if (decision === 'witness') {
       const name = (witness_name || '').trim();
       if (!name) return res.status(400).json({ error: 'witness_name is required for a witness decision' });
@@ -190,21 +273,26 @@ async function applySpeaker(req, res) {
       applied = { type: 'unknown' };
     }
 
+    // The representative suggestion comes from HOME turns only (raw label =
+    // key), so a moved-in turn's foreign suggestion can't decide accepted-vs-
+    // edited for this bucket.
     const { rows: sug } = await client.query(
       `SELECT suggestions -> 'attribution' AS attribution
          FROM speaker_turns
-        WHERE transcript_id = $1 AND speaker_label_raw = $2 LIMIT 1`,
-      [transcriptId, speaker_label_raw]
+        WHERE transcript_id = $1 AND speaker_key = $2
+          AND speaker_key = speaker_label_raw AND suggestions ? 'attribution'
+        LIMIT 1`,
+      [transcriptId, speaker_key]
     );
     const status = statusFor(applied, sug[0]?.attribution);
 
     await client.query('BEGIN');
-    const updated = await applyToSpeaker(client, transcriptId, speaker_label_raw, applied, status);
+    const updated = await applyToSpeaker(client, transcriptId, speaker_key, applied, status);
     const demoted = updated ? await maybeDemote(client, req.params.id) : false;
     await client.query('COMMIT');
 
-    if (!updated) return res.status(404).json({ error: 'No turns matched that speaker label' });
-    res.json({ data: { speaker_label_raw, attribution_status: status, turns_updated: updated, demoted } });
+    if (!updated) return res.status(404).json({ error: 'No turns matched that speaker' });
+    res.json({ data: { speaker_key, attribution_status: status, turns_updated: updated, demoted } });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error(err);
@@ -215,12 +303,16 @@ async function applySpeaker(req, res) {
 }
 
 // ── PATCH /api/admin/hearings/:id/turns/:turnId ─────────────────────────────
-//  Override ONE turn (diarization drift). Pins it so speaker-level writes skip
-//  it. decision 'reset' un-pins and re-inherits the speaker's current identity.
+//  Move ONE turn to another bucket (the per-turn reassign). Payloads:
+//    { target_speaker_key }                      join an existing bucket
+//    { decision, member_id|witness_name,
+//      new_speaker? }                            resolve/create a bucket
+//    { decision: 'reset' }                       return to the home bucket
 async function overrideTurn(req, res) {
-  const { decision, member_id, witness_name } = req.body || {};
-  if (!['member', 'witness', 'unknown', 'reset'].includes(decision)) {
-    return res.status(400).json({ error: 'decision must be member|witness|unknown|reset' });
+  const { decision, member_id, witness_name, target_speaker_key, new_speaker } = req.body || {};
+  const hasTarget = typeof target_speaker_key === 'string' && target_speaker_key.length > 0;
+  if (!hasTarget && !['member', 'witness', 'unknown', 'reset'].includes(decision)) {
+    return res.status(400).json({ error: 'Provide target_speaker_key or decision (member|witness|unknown|reset)' });
   }
 
   const client = await db.connect();
@@ -228,69 +320,89 @@ async function overrideTurn(req, res) {
     const transcriptId = await primaryTranscriptId(client, req.params.id);
     if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
 
-    // Confirm the turn belongs to this hearing's transcript; get its speaker label.
     const { rows: tRows } = await client.query(
-      `SELECT id, speaker_label_raw FROM speaker_turns WHERE id = $1 AND transcript_id = $2`,
+      `SELECT id, speaker_label_raw, speaker_key FROM speaker_turns
+        WHERE id = $1 AND transcript_id = $2`,
       [req.params.turnId, transcriptId]
     );
     if (!tRows.length) return res.status(404).json({ error: 'Turn not found in this hearing' });
-    const label = tRows[0].speaker_label_raw;
+    const turn = tRows[0];
 
     await client.query('BEGIN');
 
-    if (decision === 'reset') {
-      // Re-inherit from a non-pinned sibling of the same speaker; if none, revert
-      // to the pending (unverified) state so the suggestion shows again.
+    if (!hasTarget && decision === 'reset') {
+      // Return to the home bucket (raw label) and re-inherit its identity.
+      if (!turn.speaker_label_raw) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'This turn has no diarization label to reset to' });
+      }
       const { rows: sib } = await client.query(
         `SELECT member_id, speaker_name, speaker_role, attribution_status
            FROM speaker_turns
-          WHERE transcript_id = $1 AND speaker_label_raw = $2 AND id <> $3
+          WHERE transcript_id = $1 AND speaker_key = $2 AND id <> $3
             AND NOT (suggestions ? 'turn_override')
           LIMIT 1`,
-        [transcriptId, label, req.params.turnId]
+        [transcriptId, turn.speaker_label_raw, turn.id]
       );
       const s = sib[0] || { member_id: null, speaker_name: null, speaker_role: null, attribution_status: 'unverified' };
       await client.query(
         `UPDATE speaker_turns
-            SET member_id = $2, speaker_name = $3, speaker_role = $4, attribution_status = $5,
+            SET speaker_key = speaker_label_raw,
+                member_id = $2, speaker_name = $3, speaker_role = $4, attribution_status = $5,
                 suggestions = suggestions - 'turn_override'
           WHERE id = $1`,
-        [req.params.turnId, s.member_id, s.speaker_name, s.speaker_role, s.attribution_status]
+        [turn.id, s.member_id, s.speaker_name, s.speaker_role, s.attribution_status]
       );
     } else {
-      let memberId = null, speakerName = null, role;
-      if (decision === 'member') {
-        if (!member_id) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'member_id is required' }); }
-        const { rows } = await client.query(
-          `SELECT (SELECT cm.role FROM committee_memberships cm
-                    WHERE cm.member_id = m.id ORDER BY cm.congress DESC NULLS LAST LIMIT 1) AS role
-             FROM members m WHERE m.id = $1`,
-          [member_id]
-        );
-        if (!rows.length) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'member_id is not a tracked roster member' }); }
-        memberId = member_id; role = roleForMember(rows[0].role);
-      } else if (decision === 'witness') {
-        speakerName = (witness_name || '').trim();
-        if (!speakerName) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'witness_name is required' }); }
-        role = 'witness';
+      let key, identity, status;
+      if (hasTarget) {
+        const rep = await bucketRep(client, transcriptId, target_speaker_key);
+        if (!rep) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: 'target_speaker_key does not exist in this transcript' });
+        }
+        key = target_speaker_key;
+        identity = rep;
+        status = joinStatus(rep);
       } else {
-        role = 'unknown';
+        let memberId = null, speakerName = null, role;
+        if (decision === 'member') {
+          if (!member_id) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'member_id is required' }); }
+          role = await rosterRole(client, member_id);
+          if (!role) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'member_id is not a tracked roster member' }); }
+          memberId = member_id;
+        } else if (decision === 'witness') {
+          speakerName = (witness_name || '').trim();
+          if (!speakerName) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'witness_name is required' }); }
+          role = 'witness';
+        } else {
+          role = 'unknown';
+        }
+        key = await resolveIdentityBucket(client, transcriptId, decision, memberId, speakerName,
+          new_speaker === true || decision === 'unknown');
+        identity = { member_id: memberId, speaker_name: speakerName, speaker_role: role };
+        status = 'edited';
       }
 
-      const marker = JSON.stringify({ decision, member_id: memberId, speaker_name: speakerName, at: new Date().toISOString() });
+      const marker = overrideMarker({
+        moved_from: turn.speaker_key,
+        target_speaker_key: key,
+        decision: hasTarget ? 'existing' : decision,
+      });
       await client.query(
         `UPDATE speaker_turns
-            SET member_id = $2, speaker_name = $3, speaker_role = $4, attribution_status = 'edited',
-                suggestions = jsonb_set(coalesce(suggestions, '{}'::jsonb), '{turn_override}', $5::jsonb, true)
+            SET speaker_key = $2, member_id = $3, speaker_name = $4, speaker_role = $5,
+                attribution_status = $6,
+                suggestions = jsonb_set(coalesce(suggestions, '{}'::jsonb), '{turn_override}', $7::jsonb, true)
           WHERE id = $1`,
-        [req.params.turnId, memberId, speakerName, role, marker]
+        [turn.id, key, identity.member_id, identity.speaker_name, identity.speaker_role, status, marker]
       );
     }
 
     const demoted = await maybeDemote(client, req.params.id);
     await client.query('COMMIT');
 
-    res.json({ data: { turn_id: req.params.turnId, decision, demoted } });
+    res.json({ data: { turn_id: turn.id, demoted } });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error(err);
@@ -301,8 +413,8 @@ async function overrideTurn(req, res) {
 }
 
 // ── POST /api/admin/hearings/:id/accept-all ─────────────────────────────────
-//  Fill every pending speaker's suggestion in one shot: unverified, non-pinned
-//  turns only — never overwrites work already done.
+//  Fill every pending bucket's suggestion in one shot: still-unverified turns
+//  only — never overwrites prior work. Suggestions are read from home turns.
 async function acceptAll(req, res) {
   const client = await db.connect();
   try {
@@ -310,12 +422,16 @@ async function acceptAll(req, res) {
     if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
 
     const { rows: speakers } = await client.query(`
-      SELECT st.speaker_label_raw AS label,
-             (array_agg(st.suggestions -> 'attribution') FILTER (WHERE st.suggestions ? 'attribution'))[1] AS suggestion
+      SELECT st.speaker_key AS key,
+             (array_agg(st.suggestions -> 'attribution')
+                FILTER (WHERE st.suggestions ? 'attribution'
+                          AND st.speaker_key = st.speaker_label_raw))[1] AS suggestion
         FROM speaker_turns st
        WHERE st.transcript_id = $1
-       GROUP BY st.speaker_label_raw
+       GROUP BY st.speaker_key
     `, [transcriptId]);
+    const { rows: ordRows } = await client.query(ORDINALS_SQL, [transcriptId]);
+    const labelOf = new Map(ordRows.map((r) => [r.speaker_key, `Speaker ${r.speaker_ordinal}`]));
 
     const roster = await loadRoster(client);
     const roleById = new Map(roster.map((m) => [m.id, roleForMember(m.role)]));
@@ -325,18 +441,19 @@ async function acceptAll(req, res) {
 
     await client.query('BEGIN');
     for (const s of speakers) {
+      const label = labelOf.get(s.key) ?? s.key;
       const sug = s.suggestion?.suggested_identity;
-      if (!sug) { skipped.push({ label: s.label, reason: 'no_suggestion' }); continue; }
+      if (!sug) { skipped.push({ label, reason: 'no_suggestion' }); continue; }
 
       let identity;
       if (sug.type === 'member') {
         if (!sug.member_id || !roleById.has(sug.member_id)) {
-          skipped.push({ label: s.label, reason: 'suggested_member_not_in_roster' });
+          skipped.push({ label, reason: 'suggested_member_not_in_roster' });
           continue;
         }
         identity = { type: 'member', member_id: sug.member_id, role: roleById.get(sug.member_id) };
       } else if (sug.type === 'witness') {
-        if (!sug.display_name) { skipped.push({ label: s.label, reason: 'witness_without_name' }); continue; }
+        if (!sug.display_name) { skipped.push({ label, reason: 'witness_without_name' }); continue; }
         identity = { type: 'witness', speaker_name: sug.display_name };
       } else {
         identity = { type: 'unknown' };
@@ -346,16 +463,15 @@ async function acceptAll(req, res) {
       const { rowCount } = await client.query(
         `UPDATE speaker_turns
             SET member_id = $3, speaker_name = $4, speaker_role = $5, attribution_status = 'attributed'
-          WHERE transcript_id = $1 AND speaker_label_raw = $2
-            AND attribution_status = 'unverified' AND NOT (suggestions ? 'turn_override')`,
+          WHERE transcript_id = $1 AND speaker_key = $2 AND attribution_status = 'unverified'`,
         [
-          transcriptId, s.label,
+          transcriptId, s.key,
           identity.type === 'member' ? identity.member_id : null,
           identity.type === 'witness' ? identity.speaker_name : null,
           identity.type === 'member' ? identity.role : identity.type === 'witness' ? 'witness' : 'unknown',
         ]
       );
-      if (rowCount > 0) applied.push({ label: s.label, type: identity.type, turns: rowCount });
+      if (rowCount > 0) applied.push({ label, type: identity.type, turns: rowCount });
     }
     const demoted = applied.length ? await maybeDemote(client, req.params.id) : false;
     await client.query('COMMIT');
@@ -370,9 +486,314 @@ async function acceptAll(req, res) {
   }
 }
 
+// ── POST /api/admin/hearings/:id/turns/:turnId/split ────────────────────────
+//  Cut one turn into two at a word boundary. The two halves plus the recorded
+//  joiner are exact complementary slices of raw_text (asserted, never
+//  assumed); word_times are partitioned as arrays. Half B's bucket comes from
+//  `assign`: inherit (default) | existing bucket | new speaker.
+async function splitTurn(req, res) {
+  const { word_index, char_offset } = req.body || {};
+  const assign = req.body?.assign || { mode: 'inherit' };
+  if (!['inherit', 'existing', 'new'].includes(assign.mode)) {
+    return res.status(400).json({ error: "assign.mode must be inherit|existing|new" });
+  }
+
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
+
+    await client.query('BEGIN');
+    await client.query('SET CONSTRAINTS speaker_turns_transcript_seq_uniq DEFERRED');
+
+    const { rows: tRows } = await client.query(
+      `SELECT * FROM speaker_turns WHERE id = $1 AND transcript_id = $2 FOR UPDATE`,
+      [req.params.turnId, transcriptId]
+    );
+    if (!tRows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Turn not found in this hearing' }); }
+    const orig = tRows[0];
+
+    // Partition. Throws { status, message } on any violation — nothing written.
+    let part;
+    try {
+      if (Array.isArray(orig.word_times) && orig.word_times.length) {
+        // A timed turn must split at a word boundary — a char split would
+        // orphan its word_times and silently lose timing.
+        if (!Number.isInteger(word_index)) throw { status: 400, message: 'word_index is required for a timed turn' };
+        part = splitAtWord(orig.raw_text, orig.word_times, word_index);
+      } else if (Number.isInteger(char_offset)) {
+        part = splitAtChar(orig.raw_text, char_offset);
+      } else {
+        throw { status: 400, message: 'char_offset is required for an untimed turn' };
+      }
+    } catch (e) {
+      await client.query('ROLLBACK');
+      if (e.status) return res.status(e.status).json({ error: e.message });
+      throw e;
+    }
+    const { textA, joiner, textB, wtA, wtB } = part;
+
+    // Resolve half B's bucket + identity.
+    let bKey, bIdentity, bStatus, bMarker = null;
+    if (assign.mode === 'inherit') {
+      bKey = orig.speaker_key;
+      bIdentity = { member_id: orig.member_id, speaker_name: orig.speaker_name, speaker_role: orig.speaker_role };
+      bStatus = orig.attribution_status;
+    } else if (assign.mode === 'existing') {
+      const rep = await bucketRep(client, transcriptId, assign.speaker_key);
+      if (!rep) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'assign.speaker_key does not exist in this transcript' }); }
+      bKey = assign.speaker_key;
+      bIdentity = rep;
+      bStatus = joinStatus(rep);
+      bMarker = overrideMarker({ moved_from: orig.speaker_key, target_speaker_key: bKey, decision: 'existing' });
+    } else {
+      let memberId = null, speakerName = null, role = null;
+      if (assign.decision === 'member') {
+        role = await rosterRole(client, assign.member_id);
+        if (!role) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'assign.member_id is not a tracked roster member' }); }
+        memberId = assign.member_id;
+      } else if (assign.decision === 'witness') {
+        speakerName = (assign.witness_name || '').trim();
+        if (!speakerName) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'assign.witness_name is required' }); }
+        role = 'witness';
+      } else if (assign.decision === 'unknown') {
+        role = 'unknown';
+      } // no decision → unidentified new speaker, stays pending
+      bKey = newSpeakerKey();
+      bIdentity = { member_id: memberId, speaker_name: speakerName, speaker_role: role };
+      bStatus = assign.decision ? 'edited' : 'unverified';
+      bMarker = overrideMarker({ moved_from: orig.speaker_key, target_speaker_key: bKey, decision: assign.decision ?? 'new' });
+    }
+
+    // Make room, insert half B, then stamp both structural markers.
+    await client.query(
+      `UPDATE speaker_turns SET seq = seq + 1 WHERE transcript_id = $1 AND seq > $2`,
+      [transcriptId, orig.seq]
+    );
+
+    const bSuggestions = {};
+    if (assign.mode === 'inherit' && orig.suggestions?.attribution) bSuggestions.attribution = orig.suggestions.attribution;
+    if (bMarker) bSuggestions.turn_override = JSON.parse(bMarker);
+    bSuggestions.structural = { op: 'split', sibling: orig.id, joiner, at: new Date().toISOString() };
+
+    const { rows: bRows } = await client.query(
+      `INSERT INTO speaker_turns
+         (transcript_id, seq, speaker_label_raw, speaker_key, start_ms, end_ms,
+          confidence, attribution_status, raw_text, word_times, suggestions,
+          member_id, speaker_name, speaker_role)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14)
+       RETURNING id`,
+      [
+        transcriptId, orig.seq + 1, orig.speaker_label_raw, bKey,
+        wtB ? wtB[0].s : null, orig.end_ms,
+        meanConfidence(wtB) ?? (wtB ? null : orig.confidence),
+        bStatus, textB, wtB ? JSON.stringify(wtB) : null, JSON.stringify(bSuggestions),
+        bIdentity.member_id, bIdentity.speaker_name, bIdentity.speaker_role,
+      ]
+    );
+    const newId = bRows[0].id;
+
+    await client.query(
+      `UPDATE speaker_turns
+          SET raw_text = $2, word_times = $3::jsonb, end_ms = $4, confidence = $5,
+              clean_text = NULL,
+              suggestions = jsonb_set(coalesce(suggestions, '{}'::jsonb), '{structural}', $6::jsonb, true)
+        WHERE id = $1`,
+      [
+        orig.id, textA, wtA ? JSON.stringify(wtA) : null,
+        // Untimed split: half A's true end time is unknown (the cut is mid-turn).
+        wtA ? wtA[wtA.length - 1].e : null,
+        meanConfidence(wtA) ?? (wtA ? null : orig.confidence),
+        JSON.stringify({ op: 'split', sibling: newId, joiner, at: new Date().toISOString() }),
+      ]
+    );
+
+    const demoted = await maybeDemote(client, req.params.id);
+    await client.query('COMMIT');
+
+    res.json({ data: { turn_id: orig.id, new_turn_id: newId, demoted } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+}
+
+// ── POST /api/admin/hearings/:id/turns/:turnId/merge ────────────────────────
+//  Delete-a-turn-without-losing-a-word: the victim's text merges into the
+//  adjacent turn ('up' = previous, default; 'down' = next). The surviving turn
+//  keeps ITS identity; a seam marker records where the absorbed text begins.
+async function mergeTurn(req, res) {
+  const direction = req.body?.direction ?? 'up';
+  if (!['up', 'down'].includes(direction)) {
+    return res.status(400).json({ error: "direction must be 'up' or 'down'" });
+  }
+
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
+
+    await client.query('BEGIN');
+    await client.query('SET CONSTRAINTS speaker_turns_transcript_seq_uniq DEFERRED');
+
+    const { rows: vRows } = await client.query(
+      `SELECT * FROM speaker_turns WHERE id = $1 AND transcript_id = $2 FOR UPDATE`,
+      [req.params.turnId, transcriptId]
+    );
+    if (!vRows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Turn not found in this hearing' }); }
+    const victim = vRows[0];
+
+    const targetSeq = direction === 'up' ? victim.seq - 1 : victim.seq + 1;
+    const { rows: gRows } = await client.query(
+      `SELECT * FROM speaker_turns WHERE transcript_id = $1 AND seq = $2 FOR UPDATE`,
+      [transcriptId, targetSeq]
+    );
+    if (!gRows.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        error: direction === 'up'
+          ? 'No previous turn to merge into — use direction "down" for the first turn'
+          : 'No next turn to merge into — use direction "up" for the last turn',
+      });
+    }
+    const target = gRows[0];
+
+    // Reading order: first + joiner + second.
+    const first  = direction === 'up' ? target : victim;
+    const second = direction === 'up' ? victim : target;
+
+    // Re-merging split siblings uses the recorded joiner → byte-identical
+    // round trip. Otherwise the canonical single space (ingestion's own
+    // boundary), omitted when either side is empty.
+    const sibJoiner =
+      (victim.suggestions?.structural?.op === 'split' && victim.suggestions.structural.sibling === target.id)
+        ? victim.suggestions.structural.joiner
+        : (target.suggestions?.structural?.op === 'split' && target.suggestions.structural.sibling === victim.id)
+          ? target.suggestions.structural.joiner
+          : ' ';
+    const { merged, joinerUsed, seamOffset } = mergeTexts(first.raw_text, second.raw_text, sibJoiner);
+
+    // word_times: concat in reading order. An empty-text side contributes
+    // nothing; a non-empty side with missing word_times poisons the merge
+    // (timing can no longer be trusted) → NULL + warning, text untouched.
+    let mergedWt, wtLost = false;
+    const firstWt  = first.raw_text.length  ? first.word_times  : [];
+    const secondWt = second.raw_text.length ? second.word_times : [];
+    if (firstWt === null || secondWt === null) {
+      mergedWt = null;
+      wtLost = (first.raw_text.length && Array.isArray(first.word_times)) ||
+               (second.raw_text.length && Array.isArray(second.word_times));
+    } else {
+      mergedWt = [...firstWt, ...secondWt];
+      if (!mergedWt.length) mergedWt = null;
+    }
+
+    const structural = {
+      op: 'merge',
+      at: new Date().toISOString(),
+      seam_offset: seamOffset,
+      absorbed_side: direction === 'up' ? 'after' : 'before',
+      absorbed_key: victim.speaker_key,
+      absorbed_distinct: victim.speaker_key !== target.speaker_key,
+      absorbed_name: null,
+    };
+    if (victim.member_id) {
+      const { rows: mRows } = await client.query(`SELECT full_name FROM members WHERE id = $1`, [victim.member_id]);
+      structural.absorbed_name = mRows[0]?.full_name ?? null;
+    } else if (victim.speaker_name) {
+      structural.absorbed_name = victim.speaker_name;
+    }
+
+    await client.query(
+      `UPDATE speaker_turns
+          SET raw_text = $2, word_times = $3::jsonb, clean_text = NULL,
+              start_ms = $4, end_ms = $5, confidence = $6, attribution_status = 'edited',
+              suggestions = jsonb_set(coalesce(suggestions, '{}'::jsonb), '{structural}', $7::jsonb, true)
+        WHERE id = $1`,
+      [
+        target.id, merged, mergedWt ? JSON.stringify(mergedWt) : null,
+        first.start_ms ?? second.start_ms, second.end_ms ?? first.end_ms,
+        meanConfidence(mergedWt) ?? target.confidence,
+        JSON.stringify(structural),
+      ]
+    );
+    await client.query(`DELETE FROM speaker_turns WHERE id = $1`, [victim.id]);
+    await client.query(
+      `UPDATE speaker_turns SET seq = seq - 1 WHERE transcript_id = $1 AND seq > $2`,
+      [transcriptId, victim.seq]
+    );
+
+    const demoted = await maybeDemote(client, req.params.id);
+    await client.query('COMMIT');
+
+    res.json({ data: { merged_into: target.id, deleted_turn_id: victim.id, word_times_lost: !!wtLost, demoted } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+}
+
+// ── POST /api/admin/hearings/:id/turns/:turnId/insert ───────────────────────
+//  Insert a blank turn before/after the anchor. It gets a fresh, pending
+//  bucket (blocks tier promotion until identified) and empty text — filling
+//  in words is the next slice's content editing.
+async function insertTurn(req, res) {
+  const position = req.body?.position;
+  if (!['before', 'after'].includes(position)) {
+    return res.status(400).json({ error: "position must be 'before' or 'after'" });
+  }
+
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
+
+    await client.query('BEGIN');
+    await client.query('SET CONSTRAINTS speaker_turns_transcript_seq_uniq DEFERRED');
+
+    const { rows: aRows } = await client.query(
+      `SELECT id, seq FROM speaker_turns WHERE id = $1 AND transcript_id = $2 FOR UPDATE`,
+      [req.params.turnId, transcriptId]
+    );
+    if (!aRows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Turn not found in this hearing' }); }
+
+    const newSeq = position === 'before' ? aRows[0].seq : aRows[0].seq + 1;
+    await client.query(
+      `UPDATE speaker_turns SET seq = seq + 1 WHERE transcript_id = $1 AND seq >= $2`,
+      [transcriptId, newSeq]
+    );
+
+    const { rows: nRows } = await client.query(
+      `INSERT INTO speaker_turns
+         (transcript_id, seq, speaker_key, attribution_status, raw_text, suggestions)
+       VALUES ($1, $2, $3, 'unverified', '', $4::jsonb)
+       RETURNING id`,
+      [transcriptId, newSeq, newSpeakerKey(),
+       JSON.stringify({ structural: { op: 'insert', at: new Date().toISOString() } })]
+    );
+
+    const demoted = await maybeDemote(client, req.params.id);
+    await client.query('COMMIT');
+
+    res.json({ data: { new_turn_id: nRows[0].id, demoted } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+}
+
 // ── POST /api/admin/hearings/:id/status ─────────────────────────────────────
 //  Tier promotion: attributed (tier 1) or verified (tier 2). Both hard-gated on
-//  every speaker being reviewed (no 'unverified' turn may reach the public).
+//  every bucket being reviewed (no 'unverified' turn may reach the public).
 async function setStatus(req, res) {
   const { status } = req.body || {};
   if (!['attributed', 'verified'].includes(status)) {
@@ -385,16 +806,20 @@ async function setStatus(req, res) {
     if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
 
     const { rows: pending } = await client.query(
-      `SELECT DISTINCT speaker_label_raw
-         FROM speaker_turns
-        WHERE transcript_id = $1 AND attribution_status = 'unverified'
-        ORDER BY speaker_label_raw`,
+      `SELECT 'Speaker ' || f.speaker_ordinal AS label
+         FROM (SELECT speaker_key,
+                      dense_rank() OVER (ORDER BY min(seq))::int AS speaker_ordinal,
+                      bool_or(attribution_status = 'unverified') AS pending
+                 FROM speaker_turns WHERE transcript_id = $1
+                GROUP BY speaker_key) f
+        WHERE f.pending
+        ORDER BY f.speaker_ordinal`,
       [transcriptId]
     );
     if (pending.length) {
       return res.status(400).json({
         error: 'Cannot promote: some speakers are not yet reviewed',
-        unresolved: pending.map((r) => r.speaker_label_raw),
+        unresolved: pending.map((r) => r.label),
       });
     }
 
@@ -414,4 +839,7 @@ async function setStatus(req, res) {
   }
 }
 
-module.exports = { listAdminHearings, getReview, applySpeaker, overrideTurn, acceptAll, setStatus };
+module.exports = {
+  listAdminHearings, getReview, applySpeaker, overrideTurn,
+  acceptAll, splitTurn, mergeTurn, insertTurn, setStatus,
+};

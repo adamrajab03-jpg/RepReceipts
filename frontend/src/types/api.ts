@@ -102,6 +102,8 @@ export interface SpeakerTurn {
   seq: number
   member_id: string | null
   speaker_label_raw: string | null
+  /** Derived "Speaker N" ordinal (appearance order of editable speaker buckets). */
+  speaker_ordinal: number
   speaker_name: string | null
   speaker_role: 'chair' | 'member' | 'witness' | 'staff' | 'unknown' | null
   start_ms: number | null
@@ -247,19 +249,42 @@ export interface RosterMember {
   role: 'chair' | 'ranking_member' | 'member' | null
 }
 
+/** Last structural op recorded on a turn (suggestions.structural). */
+export interface StructuralMarker {
+  op: 'split' | 'merge' | 'insert'
+  at: string
+  /** split: the other half's turn id + the exact joiner between the halves. */
+  sibling?: string
+  joiner?: string
+  /** merge: char index in raw_text where the absorbed text begins/ends. */
+  seam_offset?: number
+  absorbed_side?: 'before' | 'after'
+  absorbed_key?: string
+  absorbed_name?: string | null
+  /** merge: true when the absorbed turn belonged to a different speaker. */
+  absorbed_distinct?: boolean
+}
+
 export interface ReviewTurn {
   id: string
   seq: number
   start_ms: number | null
-  speaker_label_raw: string
+  /** Immutable Deepgram diarization label; null for admin-inserted turns. */
+  speaker_label_raw: string | null
+  /** Editable speaker bucket this turn belongs to. */
+  speaker_key: string
+  /** Derived "Speaker N" ordinal (appearance order of buckets). */
+  speaker_ordinal: number
   member_id: string | null
   speaker_name: string | null
   speaker_role: string | null
   attribution_status: 'auto' | 'verified' | 'unverified' | 'edited' | 'attributed'
   raw_text: string
+  word_times: WordTime[] | null
   member_full_name: string | null
   suggestion: AttributionSuggestion | null
   pinned: boolean
+  structural: StructuralMarker | null
 }
 
 export interface ReviewData {

@@ -38,17 +38,29 @@ function useInvalidate(hearingId: string) {
 }
 
 export interface SpeakerDecision {
-  speaker_label_raw: string
+  speaker_key: string
   decision: 'member' | 'witness' | 'unknown'
   member_id?: string
   witness_name?: string
 }
 
-export interface TurnDecision {
+/** Per-turn move: join an existing bucket, resolve an identity (optionally
+ *  forcing a new speaker bucket), or reset to the home bucket. */
+export type TurnDecision = { turnId: string } & (
+  | { target_speaker_key: string }
+  | { decision: 'member'; member_id: string; new_speaker?: boolean }
+  | { decision: 'witness'; witness_name: string; new_speaker?: boolean }
+  | { decision: 'unknown' }
+  | { decision: 'reset' }
+)
+
+export interface SplitPayload {
   turnId: string
-  decision: 'member' | 'witness' | 'unknown' | 'reset'
-  member_id?: string
-  witness_name?: string
+  word_index: number
+  assign:
+    | { mode: 'inherit' }
+    | { mode: 'existing'; speaker_key: string }
+    | { mode: 'new'; decision?: 'member' | 'witness' | 'unknown'; member_id?: string; witness_name?: string }
 }
 
 interface Demotable { demoted?: boolean }
@@ -81,6 +93,55 @@ export function useOverrideTurn(hearingId: string) {
       })
       const body = await res.json()
       if (!res.ok) throw new Error(body.error ?? 'Failed to override turn')
+      return body.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+// ── Structural edits: split / merge-delete / insert ─────────────────────────
+export function useSplitTurn(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ turnId, ...payload }: SplitPayload): Promise<Demotable & { new_turn_id: string }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/split`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.error ?? 'Split failed')
+      return body.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+export function useMergeTurn(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ turnId, direction }: { turnId: string; direction: 'up' | 'down' }): Promise<Demotable & { word_times_lost: boolean }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/merge`, {
+        method: 'POST',
+        body: JSON.stringify({ direction }),
+      })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.error ?? 'Merge failed')
+      return body.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+export function useInsertTurn(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ turnId, position }: { turnId: string; position: 'before' | 'after' }): Promise<Demotable & { new_turn_id: string }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/insert`, {
+        method: 'POST',
+        body: JSON.stringify({ position }),
+      })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.error ?? 'Insert failed')
       return body.data
     },
     onSuccess: invalidate,

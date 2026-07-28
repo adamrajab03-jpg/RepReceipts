@@ -1,7 +1,7 @@
-// Assigns a stable color to each *effective identity* in a transcript
-// (member_id ?? speaker_name ?? speaker_label_raw), in order of first appearance.
-// Coloring by effective identity means a drifted turn shows a wrong color mid-
-// block, and correcting it recolors to match its true speaker's block.
+// Assigns a stable color to each speaker BUCKET (speaker_key) in a transcript,
+// in order of first appearance. Bucket colors don't shift when a bucket's
+// identity is edited; a turn moved between buckets visibly adopts its new
+// bucket's color.
 //
 // Full literal class strings (no interpolation) so Tailwind keeps them.
 const PALETTE = [
@@ -19,20 +19,15 @@ const PALETTE = [
   'border-l-pink-400 bg-pink-50',
 ]
 
-interface HasIdentity {
-  member_id: string | null
-  speaker_name: string | null
-  speaker_label_raw: string
+interface HasBucket {
+  speaker_key: string
 }
 
-const keyOf = (t: HasIdentity) => t.member_id ?? t.speaker_name ?? t.speaker_label_raw
-
-export function makeSpeakerColors(turns: HasIdentity[]): (t: HasIdentity) => string {
+export function makeSpeakerColors(turns: HasBucket[]): (t: HasBucket) => string {
   const map = new Map<string, string>()
   let i = 0
   for (const t of turns) {
-    const k = keyOf(t)
-    if (!map.has(k)) { map.set(k, PALETTE[i % PALETTE.length]); i++ }
+    if (!map.has(t.speaker_key)) { map.set(t.speaker_key, PALETTE[i % PALETTE.length]); i++ }
   }
-  return (t: HasIdentity) => map.get(keyOf(t)) ?? PALETTE[0]
+  return (t: HasBucket) => map.get(t.speaker_key) ?? PALETTE[0]
 }

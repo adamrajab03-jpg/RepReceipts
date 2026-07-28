@@ -124,9 +124,14 @@ async function getHearingTranscript(req, res) {
 
     const transcript = txRows[0];
 
+    // speaker_ordinal is the derived "Speaker N" (appearance order of editable
+    // speaker buckets) — the display fallback for unattributed speakers, kept
+    // consistent with the review workbench even after structural edits.
+    // Blank turns (admin-inserted slots awaiting text) are excluded.
     const { rows: turns } = await db.query(`
       SELECT
         st.id, st.seq, st.member_id, st.speaker_label_raw,
+        f.speaker_ordinal,
         st.speaker_name, st.speaker_role,
         st.start_ms, st.end_ms, st.attribution_status,
         st.raw_text, st.clean_text, st.word_times, st.is_edited,
@@ -141,8 +146,11 @@ async function getHearingTranscript(req, res) {
           '[]'
         ) AS topics
       FROM speaker_turns st
+      JOIN (SELECT speaker_key, dense_rank() OVER (ORDER BY min(seq))::int AS speaker_ordinal
+              FROM speaker_turns WHERE transcript_id = $1
+             GROUP BY speaker_key) f ON f.speaker_key = st.speaker_key
       LEFT JOIN members m ON m.id = st.member_id
-      WHERE st.transcript_id = $1
+      WHERE st.transcript_id = $1 AND st.raw_text <> ''
       ORDER BY st.seq
     `, [transcript.id]);
 

@@ -2,18 +2,32 @@ import { useState, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import {
   useReview, useApplySpeaker, useOverrideTurn, useAcceptAll, useSetStatus,
-  type SpeakerDecision, type TurnDecision,
+  useSplitTurn, useMergeTurn, useInsertTurn,
+  type SpeakerDecision, type TurnDecision, type SplitPayload,
 } from '../hooks/useAdmin'
 import type { ReviewTurn, RosterMember } from '../types/api'
 import { makeSpeakerColors } from '../utils/speakerColors'
 import { tierBadge } from '../utils/hearingTier'
 import { cn } from '../utils/cn'
 
+// ── Decisions ────────────────────────────────────────────────────────────────
 type BareDecision =
   | { decision: 'member'; member_id: string }
   | { decision: 'witness'; witness_name: string }
   | { decision: 'unknown' }
   | { decision: 'reset' }
+
+type TurnEditorDecision = { target_speaker_key: string } | BareDecision
+
+/** One speaker bucket, for pickers ("Speaker 2 · Andy Kim"). */
+interface BucketInfo {
+  key: string
+  ordinal: number
+  name: string | null
+  memberId: string | null
+  role: string | null
+  count: number
+}
 
 function fmtMs(ms: number | null) {
   if (ms == null) return ''
@@ -23,6 +37,8 @@ function fmtMs(ms: number | null) {
 
 function confPct(c: number) { return `${Math.round(c * 100)}%` }
 function confColor(c: number) { return c >= 0.85 ? 'text-green-700' : c >= 0.6 ? 'text-amber-700' : 'text-red-600' }
+
+const ordinalLabel = (n: number) => `Speaker ${n}`
 
 // ── Shared assign control (roster typeahead + witness + unknown [+ reset]) ────
 function MiniAssign({ roster, onDecision, allowReset }: {
@@ -39,13 +55,13 @@ function MiniAssign({ roster, onDecision, allowReset }: {
   }, [q, roster])
 
   return (
-    <div className="mt-2 rounded-lg border border-gray-200 bg-white p-2 space-y-2">
+    <div className="space-y-2">
       <input
         value={q} onChange={e => setQ(e.target.value)} autoFocus
         placeholder="Search roster by name or state…"
         className="w-full text-sm px-2.5 py-1.5 rounded-md border border-gray-300 focus:outline-none focus:ring-2 focus:ring-slate-400"
       />
-      <div className="max-h-44 overflow-auto rounded-md border border-gray-100 divide-y divide-gray-50">
+      <div className="max-h-44 overflow-auto rounded-md border border-gray-100 divide-y divide-gray-50 bg-white">
         {matches.map(m => (
           <button key={m.id} onClick={() => onDecision({ decision: 'member', member_id: m.id })}
             className="w-full text-left px-2.5 py-1.5 text-sm hover:bg-slate-50 flex items-center gap-2">
@@ -70,15 +86,135 @@ function MiniAssign({ roster, onDecision, allowReset }: {
       </div>
       <div className="flex items-center gap-3 text-sm">
         <button onClick={() => onDecision({ decision: 'unknown' })} className="text-gray-500 hover:text-gray-700 underline">Mark unknown</button>
-        {allowReset && <button onClick={() => onDecision({ decision: 'reset' })} className="text-blue-600 hover:text-blue-800 underline">Reset to speaker</button>}
+        {allowReset && <button onClick={() => onDecision({ decision: 'reset' })} className="text-blue-600 hover:text-blue-800 underline">Reset to original speaker</button>}
       </div>
     </div>
   )
 }
 
-// ── Speaker header (rendered at each speaker's first turn) ────────────────────
-function SpeakerHeader({ label, info, roster, busy, onSpeaker }: {
-  label: string
+// ── Per-turn editor: buckets first, then the full assign control ─────────────
+function TurnAssign({ turn, buckets, roster, onDecision }: {
+  turn: ReviewTurn
+  buckets: BucketInfo[]
+  roster: RosterMember[]
+  onDecision: (d: TurnEditorDecision) => void
+}) {
+  const others = buckets.filter(b => b.key !== turn.speaker_key)
+  return (
+    <div className="mt-2 rounded-lg border-2 border-amber-400 bg-amber-50/60 p-2 space-y-2">
+      <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-700">This turn only</p>
+      {others.length > 0 && (
+        <div className="rounded-md border border-amber-200 bg-white divide-y divide-gray-50 max-h-36 overflow-auto">
+          {others.map(b => (
+            <button key={b.key} onClick={() => onDecision({ target_speaker_key: b.key })}
+              className="w-full text-left px-2.5 py-1.5 text-sm hover:bg-amber-50 flex items-center gap-2">
+              <span className="font-mono text-xs text-slate-500">{ordinalLabel(b.ordinal)}</span>
+              <span className="font-medium text-slate-800">{b.name ?? 'unidentified'}</span>
+              <span className="ml-auto text-xs text-gray-400">{b.count} turns</span>
+            </button>
+          ))}
+        </div>
+      )}
+      <MiniAssign
+        roster={roster}
+        allowReset={turn.pinned && turn.speaker_label_raw != null}
+        onDecision={onDecision}
+      />
+    </div>
+  )
+}
+
+// ── Split mode: click the word the second half should start with ─────────────
+function SplitMode({ turn, buckets, roster, busy, onSplit, onCancel }: {
+  turn: ReviewTurn
+  buckets: BucketInfo[]
+  roster: RosterMember[]
+  busy: boolean
+  onSplit: (payload: { word_index: number; assign: SplitPayload['assign'] }) => void
+  onCancel: () => void
+}) {
+  const [cut, setCut] = useState<number | null>(null)
+  const words = turn.word_times ?? []
+
+  // Resolve an identity choice for half B to a split assign: join the bucket
+  // that already has this exact identity, else create a new speaker bucket.
+  const assignFor = (d: TurnEditorDecision): SplitPayload['assign'] | null => {
+    if ('target_speaker_key' in d) return { mode: 'existing', speaker_key: d.target_speaker_key }
+    if (d.decision === 'reset') return null
+    if (d.decision === 'member') {
+      const b = buckets.find(x => x.memberId === d.member_id)
+      return b ? { mode: 'existing', speaker_key: b.key } : { mode: 'new', decision: 'member', member_id: d.member_id }
+    }
+    if (d.decision === 'witness') {
+      const b = buckets.find(x => x.role === 'witness' && x.name === d.witness_name)
+      return b ? { mode: 'existing', speaker_key: b.key } : { mode: 'new', decision: 'witness', witness_name: d.witness_name }
+    }
+    return { mode: 'new', decision: 'unknown' }
+  }
+
+  return (
+    <div className="mt-2 rounded-lg border-2 border-sky-400 bg-sky-50/50 p-2 space-y-2">
+      <div className="flex items-center gap-2">
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-sky-700">
+          Split — click the word the new turn should start with
+        </p>
+        <button onClick={onCancel} className="ml-auto text-xs text-gray-500 hover:text-gray-700 underline">cancel</button>
+      </div>
+      <p className="text-sm leading-relaxed text-gray-800">
+        {words.map((wt, i) => (
+          <span key={i}>
+            {i > 0 && ' '}
+            <button
+              onClick={() => i > 0 && setCut(i)}
+              disabled={i === 0}
+              className={cn(
+                'rounded-sm px-0',
+                i === 0 && 'cursor-default',
+                i > 0 && 'hover:bg-sky-200 hover:shadow-[inset_2px_0_0_0_#0369a1] cursor-pointer',
+                cut !== null && i >= cut && 'bg-sky-100',
+                cut === i && 'shadow-[inset_2px_0_0_0_#0369a1] font-medium',
+              )}
+            >{wt.w}</button>
+          </span>
+        ))}
+      </p>
+      {cut !== null && (
+        <div className="rounded-md border border-sky-200 bg-white p-2 space-y-2">
+          <p className="text-xs text-gray-600">
+            …{words.slice(Math.max(0, cut - 4), cut).map(w => w.w).join(' ')}
+            <span className="mx-1.5 font-bold text-sky-700">‖</span>
+            {words.slice(cut, cut + 4).map(w => w.w).join(' ')}…
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <button onClick={() => onSplit({ word_index: cut, assign: { mode: 'inherit' } })} disabled={busy}
+              className="text-sm font-medium px-3 py-1.5 rounded-lg bg-sky-600 text-white hover:bg-sky-500 disabled:opacity-50">
+              Split — same speaker
+            </button>
+            <span className="text-xs text-gray-500">or assign the new turn to:</span>
+          </div>
+          <TurnAssign
+            turn={turn} buckets={buckets} roster={roster}
+            onDecision={(d) => { const a = assignFor(d); if (a) onSplit({ word_index: cut, assign: a }) }}
+          />
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Speaker header (rendered at each bucket's first turn) ────────────────────
+interface SpeakerInfo {
+  count: number
+  firstTurnId: string
+  ordinal: number
+  pending: boolean
+  suggestion: ReviewTurn['suggestion']
+  appliedName: string | null
+  memberId: string | null
+  role: string | null
+}
+
+function SpeakerHeader({ info, roster, busy, onSpeaker }: {
   info: SpeakerInfo
   roster: RosterMember[]
   busy: boolean
@@ -86,21 +222,40 @@ function SpeakerHeader({ label, info, roster, busy, onSpeaker }: {
 }) {
   const [open, setOpen] = useState(false)
   const sug = info.suggestion?.suggested_identity
+  const label = ordinalLabel(info.ordinal)
+
+  const editor = open && (
+    <div className="w-full mt-2 rounded-lg border-2 border-slate-500 bg-slate-50 p-2 space-y-2">
+      <div className="flex items-center gap-2">
+        <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">
+          Applies to all {info.count} turns of {label}
+        </p>
+        <button onClick={() => setOpen(false)} className="ml-auto text-xs text-gray-500 hover:text-gray-700 underline">cancel</button>
+      </div>
+      <MiniAssign roster={roster} onDecision={(d) => { if (d.decision !== 'reset') { onSpeaker(d); setOpen(false) } }} />
+    </div>
+  )
 
   if (!info.pending) {
-    // Reviewed: compact confirmation with a re-attribute affordance.
+    // Reviewed: compact confirmation. The NAME is the edit affordance.
     return (
-      <div className="mt-4 mb-1 flex items-center gap-2 text-xs">
+      <div className="mt-4 mb-1 flex flex-wrap items-center gap-2 text-xs">
         <span className="font-mono font-semibold text-slate-700">{label}</span>
-        <span className="text-green-700">✓ attributed as <span className="font-medium">{info.appliedName}</span></span>
+        <span className="text-green-700">
+          ✓ attributed as{' '}
+          <button onClick={() => setOpen(v => !v)} disabled={busy}
+            title={`Edit all ${info.count} turns of ${label}`}
+            className="font-medium underline decoration-dotted underline-offset-2 hover:text-green-900 hover:decoration-solid">
+            {info.appliedName ?? 'Unknown'} ✎
+          </button>
+        </span>
         <span className="text-gray-400">· {info.count} turns</span>
-        <button onClick={() => setOpen(v => !v)} className="text-slate-500 hover:text-slate-700 underline">{open ? 'cancel' : 'change'}</button>
-        {open && <div className="w-full"><MiniAssign roster={roster} onDecision={(d) => { if (d.decision !== 'reset') { onSpeaker(d); setOpen(false) } }} /></div>}
+        {editor}
       </div>
     )
   }
 
-  // Pending: Claude's suggestion + reasoning, right where the speaker first appears.
+  // Pending: Claude's suggestion + reasoning, right where the bucket first appears.
   const acceptDecision: Exclude<BareDecision, { decision: 'reset' }> | null =
     !sug ? null
     : sug.type === 'member' && sug.member_id ? { decision: 'member', member_id: sug.member_id }
@@ -142,91 +297,158 @@ function SpeakerHeader({ label, info, roster, busy, onSpeaker }: {
           <button onClick={() => setOpen(v => !v)} className="underline text-slate-700">{open ? 'Cancel' : 'Assign'}</button>
         </div>
       )}
-      {open && <MiniAssign roster={roster} onDecision={(d) => { if (d.decision !== 'reset') { onSpeaker(d); setOpen(false) } }} />}
+      {editor}
     </div>
   )
 }
 
 // ── One transcript turn ───────────────────────────────────────────────────────
-function TurnRow({ turn, colorCls, roster, busy, onTurn }: {
+type Panel = 'name' | 'split' | 'merge' | 'insert' | null
+
+function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, onTurn, onSplit, onMerge, onInsert }: {
   turn: ReviewTurn
   colorCls: string
   roster: RosterMember[]
+  buckets: BucketInfo[]
   busy: boolean
-  onTurn: (d: BareDecision) => void
+  prev: { name: string; key: string } | null
+  next: { name: string; key: string } | null
+  autoOpen: boolean
+  onTurn: (d: TurnEditorDecision) => void
+  onSplit: (p: { word_index: number; assign: SplitPayload['assign'] }) => void
+  onMerge: (direction: 'up' | 'down') => void
+  onInsert: (position: 'before' | 'after') => void
 }) {
-  const [open, setOpen] = useState(false)
+  const [panel, setPanel] = useState<Panel>(autoOpen ? 'name' : null)
   const pending = turn.attribution_status === 'unverified'
   const sug = turn.suggestion?.suggested_identity
   const resolved = turn.member_full_name ?? turn.speaker_name
-  const pendingName = sug?.type === 'unknown' ? 'Unknown' : (sug?.display_name ?? turn.speaker_label_raw)
+  const pendingName = sug?.type === 'unknown' ? 'Unknown' : (sug?.display_name ?? ordinalLabel(turn.speaker_ordinal))
+  const canSplit = (turn.word_times?.length ?? 0) >= 2
+  const seam = turn.structural?.op === 'merge' ? turn.structural : null
+
+  const toggle = (p: Panel) => setPanel(cur => (cur === p ? null : p))
+  const nameBtnCls = 'underline decoration-dotted underline-offset-2 hover:decoration-solid'
+
+  // Body text: mark the merge seam so absorbed words stay visible for review.
+  const body = seam && seam.seam_offset != null && seam.seam_offset > 0 && seam.seam_offset < turn.raw_text.length ? (
+    <>
+      {turn.raw_text.slice(0, seam.seam_offset)}
+      <span
+        title={`Merged ${seam.absorbed_side === 'before' ? 'start' : 'end'}: absorbed from ${seam.absorbed_name ?? seam.absorbed_key ?? 'deleted turn'}`}
+        className={cn('mx-0.5 select-none font-bold', seam.absorbed_distinct ? 'text-amber-600' : 'text-gray-300')}
+      >⌇</span>
+      {turn.raw_text.slice(seam.seam_offset)}
+    </>
+  ) : (turn.raw_text || <span className="italic text-gray-400">empty turn — add text in the next slice, or delete-merge it</span>)
 
   return (
-    <div className={cn('border-l-4 pl-3 pr-2 py-2.5', colorCls, turn.pinned && 'ring-1 ring-inset ring-amber-400/70 rounded-r')}>
+    <div className={cn('group border-l-4 pl-3 pr-2 py-2.5', colorCls, turn.pinned && 'ring-1 ring-inset ring-amber-400/70 rounded-r')}>
       <div className="flex items-center gap-2 text-xs">
         <span className="text-gray-400 font-mono tabular-nums w-10 shrink-0">{fmtMs(turn.start_ms)}</span>
 
         {pending ? (
           <span className="flex items-center gap-1.5">
             <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 text-[11px]">pending</span>
-            <span className="font-medium text-slate-700">{pendingName}</span>
+            <button onClick={() => toggle('name')} disabled={busy}
+              title="Reassign this turn only"
+              className={cn('font-medium text-slate-700', nameBtnCls)}>{pendingName}</button>
             {turn.suggestion && <span className={cn('tabular-nums', confColor(turn.suggestion.confidence))}>{confPct(turn.suggestion.confidence)}</span>}
           </span>
         ) : (
           <span className="flex items-center gap-1.5">
-            <span className="font-semibold text-slate-800">{resolved ?? 'Unknown speaker'}</span>
-            {turn.pinned && <span className="px-1.5 py-0.5 rounded bg-amber-500 text-white text-[11px] font-medium">⟳ Override</span>}
+            <button onClick={() => toggle('name')} disabled={busy}
+              title="Reassign this turn only"
+              className={cn('font-semibold text-slate-800', nameBtnCls)}>{resolved ?? 'Unknown speaker'}</button>
+            {turn.pinned && <span className="px-1.5 py-0.5 rounded bg-amber-500 text-white text-[11px] font-medium">⟳ moved</span>}
           </span>
         )}
 
-        <span className="ml-auto flex items-center gap-2">
+        <span className="ml-auto flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
           {/* Reserved slot for the next slice's inline text-edit control. */}
-          <button onClick={() => setOpen(v => !v)} disabled={busy}
-            className="text-[11px] text-slate-500 hover:text-slate-800 underline">
-            {open ? 'close' : 'reassign'}
-          </button>
+          <button onClick={() => canSplit && toggle('split')} disabled={busy || !canSplit}
+            title={canSplit ? 'Split this turn at a word' : 'No word timing — cannot split'}
+            className="px-1.5 py-0.5 rounded text-slate-500 hover:text-sky-700 hover:bg-sky-50 disabled:opacity-30">✂</button>
+          <button onClick={() => toggle('merge')} disabled={busy || (!prev && !next)}
+            title="Delete this turn — its words merge into a neighbor"
+            className="px-1.5 py-0.5 rounded text-slate-500 hover:text-red-700 hover:bg-red-50 disabled:opacity-30">⌫</button>
+          <button onClick={() => toggle('insert')} disabled={busy}
+            title="Insert a blank turn before/after"
+            className="px-1.5 py-0.5 rounded text-slate-500 hover:text-emerald-700 hover:bg-emerald-50">+</button>
         </span>
       </div>
 
-      <p className="mt-1 text-sm text-gray-700 leading-relaxed">{turn.raw_text}</p>
+      <p className="mt-1 text-sm text-gray-700 leading-relaxed">{body}</p>
 
-      {open && (
-        <MiniAssign
-          roster={roster}
-          allowReset={turn.pinned}
-          onDecision={(d) => { onTurn(d); setOpen(false) }}
-        />
+      {panel === 'name' && (
+        <TurnAssign turn={turn} buckets={buckets} roster={roster}
+          onDecision={(d) => { onTurn(d); setPanel(null) }} />
+      )}
+      {panel === 'split' && (
+        <SplitMode turn={turn} buckets={buckets} roster={roster} busy={busy}
+          onSplit={(p) => { onSplit(p); setPanel(null) }} onCancel={() => setPanel(null)} />
+      )}
+      {panel === 'merge' && (
+        <div className="mt-2 rounded-lg border-2 border-red-300 bg-red-50/50 p-2 space-y-1.5">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-red-700">
+            Delete this turn — its words are never lost, they merge into a neighbor
+          </p>
+          {prev && (
+            <button onClick={() => { onMerge('up'); setPanel(null) }} disabled={busy}
+              className="block w-full text-left text-sm px-2.5 py-1.5 rounded-md bg-white border border-red-200 hover:bg-red-50">
+              ↑ Merge into previous — <span className="font-medium">{prev.name}</span>
+              {prev.key !== turn.speaker_key && <span className="ml-2 text-xs text-amber-700">⚠ different speaker — a seam mark will show</span>}
+            </button>
+          )}
+          {next && (
+            <button onClick={() => { onMerge('down'); setPanel(null) }} disabled={busy}
+              className="block w-full text-left text-sm px-2.5 py-1.5 rounded-md bg-white border border-red-200 hover:bg-red-50">
+              ↓ Merge into next — <span className="font-medium">{next.name}</span>
+              {next.key !== turn.speaker_key && <span className="ml-2 text-xs text-amber-700">⚠ different speaker — a seam mark will show</span>}
+            </button>
+          )}
+          <button onClick={() => setPanel(null)} className="text-xs text-gray-500 hover:text-gray-700 underline">cancel</button>
+        </div>
+      )}
+      {panel === 'insert' && (
+        <div className="mt-2 rounded-lg border-2 border-emerald-300 bg-emerald-50/50 p-2 space-y-1.5">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-700">Insert a blank turn (new speaker, empty text)</p>
+          <div className="flex gap-2">
+            <button onClick={() => { onInsert('before'); setPanel(null) }} disabled={busy}
+              className="text-sm px-2.5 py-1.5 rounded-md bg-white border border-emerald-200 hover:bg-emerald-50">↑ before this turn</button>
+            <button onClick={() => { onInsert('after'); setPanel(null) }} disabled={busy}
+              className="text-sm px-2.5 py-1.5 rounded-md bg-white border border-emerald-200 hover:bg-emerald-50">↓ after this turn</button>
+            <button onClick={() => setPanel(null)} className="text-xs text-gray-500 hover:text-gray-700 underline">cancel</button>
+          </div>
+        </div>
       )}
     </div>
   )
 }
 
-// ── Derived per-speaker info ──────────────────────────────────────────────────
-interface SpeakerInfo {
-  count: number
-  firstTurnId: string
-  pending: boolean
-  suggestion: ReviewTurn['suggestion']
-  appliedName: string
-}
-
+// ── Derived per-bucket info ───────────────────────────────────────────────────
 function buildSpeakerInfo(turns: ReviewTurn[]): Map<string, SpeakerInfo> {
   const m = new Map<string, SpeakerInfo>()
   for (const t of turns) {
-    const cur = m.get(t.speaker_label_raw)
+    const name = t.member_full_name ?? t.speaker_name ?? null
+    const cur = m.get(t.speaker_key)
     if (!cur) {
-      m.set(t.speaker_label_raw, {
-        count: 1, firstTurnId: t.id,
+      m.set(t.speaker_key, {
+        count: 1, firstTurnId: t.id, ordinal: t.speaker_ordinal,
         pending: t.attribution_status === 'unverified',
-        suggestion: t.suggestion,
-        appliedName: t.member_full_name ?? t.speaker_name ?? 'Unknown',
+        suggestion: t.pinned ? null : t.suggestion,
+        appliedName: t.pinned ? null : name,
+        memberId: t.pinned ? null : t.member_id,
+        role: t.pinned ? null : t.speaker_role,
       })
     } else {
       cur.count += 1
       if (t.attribution_status === 'unverified') cur.pending = true
-      // Prefer a resolved name from any non-pending turn.
-      if (cur.appliedName === 'Unknown' && (t.member_full_name || t.speaker_name)) {
-        cur.appliedName = t.member_full_name ?? t.speaker_name ?? 'Unknown'
+      // The bucket's identity/suggestion comes from HOME (non-moved) turns, so
+      // a single-turn move can never relabel the whole speaker header.
+      if (!t.pinned) {
+        if (cur.appliedName == null && name) { cur.appliedName = name; cur.memberId = t.member_id; cur.role = t.speaker_role }
+        if (cur.suggestion == null && t.suggestion) cur.suggestion = t.suggestion
       }
     }
   }
@@ -239,15 +461,24 @@ export default function ReviewWorkbenchPage() {
   const { data, isLoading, error } = useReview(id)
   const applySpeaker = useApplySpeaker(id)
   const overrideTurn = useOverrideTurn(id)
+  const splitTurn = useSplitTurn(id)
+  const mergeTurn = useMergeTurn(id)
+  const insertTurn = useInsertTurn(id)
   const acceptAll = useAcceptAll(id)
   const setStatus = useSetStatus(id)
 
   const [notice, setNotice] = useState<string | null>(null)
   const [confirmVerify, setConfirmVerify] = useState(false)
+  const [autoOpenId, setAutoOpenId] = useState<string | null>(null)
 
   const turns = data?.turns ?? []
   const speakerInfo = useMemo(() => buildSpeakerInfo(turns), [turns])
   const colorFor = useMemo(() => makeSpeakerColors(turns), [turns])
+  const buckets: BucketInfo[] = useMemo(() =>
+    [...speakerInfo.entries()]
+      .map(([key, s]) => ({ key, ordinal: s.ordinal, name: s.appliedName, memberId: s.memberId, role: s.role, count: s.count }))
+      .sort((a, b) => a.ordinal - b.ordinal),
+    [speakerInfo])
 
   if (isLoading) return <div className="py-16 text-center text-sm text-gray-400">Loading…</div>
   if (error || !data) return <div className="py-16 text-center text-sm text-red-600">Failed to load review data.</div>
@@ -256,7 +487,8 @@ export default function ReviewWorkbenchPage() {
   const totalSpeakers = speakerInfo.size
   const pendingSpeakers = [...speakerInfo.values()].filter(s => s.pending).length
   const reviewed = totalSpeakers - pendingSpeakers
-  const busy = applySpeaker.isPending || overrideTurn.isPending || acceptAll.isPending || setStatus.isPending
+  const busy = applySpeaker.isPending || overrideTurn.isPending || splitTurn.isPending
+    || mergeTurn.isPending || insertTurn.isPending || acceptAll.isPending || setStatus.isPending
   const badge = tierBadge(hearing.status)
   const verifyErr = setStatus.error as (Error & { unresolved?: string[] }) | null
 
@@ -264,6 +496,9 @@ export default function ReviewWorkbenchPage() {
   const flagDemotion = (r: { demoted?: boolean }) => {
     if (r?.demoted) setNotice("This edit returned the hearing to “Speakers attributed”. Re-confirm human verification when you're done.")
   }
+
+  const displayName = (t: ReviewTurn) =>
+    t.member_full_name ?? t.speaker_name ?? ordinalLabel(t.speaker_ordinal)
 
   return (
     <div>
@@ -327,19 +562,20 @@ export default function ReviewWorkbenchPage() {
 
       {/* Chronological transcript */}
       <div className="mt-4 bg-white rounded-xl border border-gray-200 divide-y divide-gray-50">
-        {turns.map(turn => {
-          const info = speakerInfo.get(turn.speaker_label_raw)!
+        {turns.map((turn, i) => {
+          const info = speakerInfo.get(turn.speaker_key)!
           const isFirst = info.firstTurnId === turn.id
+          const prev = i > 0 ? { name: displayName(turns[i - 1]), key: turns[i - 1].speaker_key } : null
+          const next = i < turns.length - 1 ? { name: displayName(turns[i + 1]), key: turns[i + 1].speaker_key } : null
           return (
             <div key={turn.id}>
               {isFirst && (
                 <div className="px-3">
                   <SpeakerHeader
-                    label={turn.speaker_label_raw}
                     info={info}
                     roster={roster}
                     busy={busy}
-                    onSpeaker={(d) => applySpeaker.mutate({ speaker_label_raw: turn.speaker_label_raw, ...d } as SpeakerDecision, { onSuccess: flagDemotion })}
+                    onSpeaker={(d) => applySpeaker.mutate({ speaker_key: turn.speaker_key, ...d } as SpeakerDecision, { onSuccess: flagDemotion })}
                   />
                 </div>
               )}
@@ -347,8 +583,22 @@ export default function ReviewWorkbenchPage() {
                 turn={turn}
                 colorCls={colorFor(turn)}
                 roster={roster}
+                buckets={buckets}
                 busy={busy}
+                prev={prev}
+                next={next}
+                autoOpen={turn.id === autoOpenId}
                 onTurn={(d) => overrideTurn.mutate({ turnId: turn.id, ...d } as TurnDecision, { onSuccess: flagDemotion })}
+                onSplit={(p) => splitTurn.mutate({ turnId: turn.id, ...p }, { onSuccess: flagDemotion })}
+                onMerge={(direction) => mergeTurn.mutate({ turnId: turn.id, direction }, {
+                  onSuccess: (r) => {
+                    flagDemotion(r)
+                    if (r.word_times_lost) setNotice('Merged — note: the surviving turn lost per-word timing (one side had none). Text is intact.')
+                  },
+                })}
+                onInsert={(position) => insertTurn.mutate({ turnId: turn.id, position }, {
+                  onSuccess: (r) => { flagDemotion(r); setAutoOpenId(r.new_turn_id) },
+                })}
               />
             </div>
           )
