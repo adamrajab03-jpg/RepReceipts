@@ -1,6 +1,44 @@
 const crypto = require('crypto');
 const db = require('../utils/db');
 const { splitAtWord, splitAtChar, mergeTexts, meanConfidence } = require('../utils/turnText');
+const { classifyEdit, applyEdits, isBulkAcceptable, anchorEdit } = require('../utils/cleanupValidate');
+const { diffToEdits } = require('../utils/textDiff');
+
+const sha256 = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+const spansOverlap = (a, b) => a.raw_start < b.raw_end && b.raw_start < a.raw_end;
+
+// clean_text is ALWAYS derived from the applied text_edits — never free-stored.
+// null when there are no edits (public read falls back to raw_text via COALESCE).
+function deriveCleanText(rawText, textEdits) {
+  if (!Array.isArray(textEdits) || !textEdits.length) return null;
+  return applyEdits(rawText, textEdits); // throws on overlap / non-reconstruction
+}
+
+async function loadTurn(runner, transcriptId, turnId) {
+  const { rows } = await runner.query(
+    `SELECT id, raw_text, suggestions FROM speaker_turns WHERE id = $1 AND transcript_id = $2`,
+    [turnId, transcriptId]
+  );
+  return rows[0] ?? null;
+}
+
+// Persist a turn's derived text state in one UPDATE. clean_text is recomputed
+// from textEdits (never trusted from the client). Always stamps text_review —
+// touching the text IS reviewing it. Pass cleanup=undefined to leave it as-is.
+async function persistTurnText(runner, turn, { textEdits, cleanup, reviewedBy }) {
+  const clean = deriveCleanText(turn.raw_text, textEdits);
+  const sugg = { ...(turn.suggestions || {}) };
+  if (Array.isArray(textEdits) && textEdits.length) sugg.text_edits = textEdits;
+  else delete sugg.text_edits;
+  if (cleanup !== undefined) { if (cleanup) sugg.cleanup = cleanup; else delete sugg.cleanup; }
+  sugg.text_review = { reviewed_at: new Date().toISOString(), by: reviewedBy ?? null };
+  await runner.query(
+    `UPDATE speaker_turns
+        SET clean_text = $2, is_edited = $3, edited_by = $4, suggestions = $5::jsonb, updated_at = now()
+      WHERE id = $1`,
+    [turn.id, clean, Array.isArray(textEdits) && textEdits.length > 0, reviewedBy ?? null, JSON.stringify(sugg)]
+  );
+}
 
 // ============================================================================
 //  Admin: attribution review, structural editing + two-tier publish.
@@ -225,11 +263,14 @@ async function getReview(req, res) {
         st.id, st.seq, st.start_ms, st.speaker_label_raw, st.speaker_key,
         f.speaker_ordinal,
         st.member_id, st.speaker_name, st.speaker_role, st.attribution_status,
-        st.raw_text, st.word_times,
+        st.raw_text, st.clean_text, st.word_times,
         m.full_name AS member_full_name,
         st.suggestions -> 'attribution' AS suggestion,
         (st.suggestions ? 'turn_override') AS pinned,
-        st.suggestions -> 'structural' AS structural
+        st.suggestions -> 'structural' AS structural,
+        st.suggestions -> 'cleanup' AS cleanup,
+        st.suggestions -> 'text_edits' AS text_edits,
+        (st.suggestions ? 'text_review') AS text_reviewed
       FROM speaker_turns st
       JOIN (${ORDINALS_SQL}) f ON f.speaker_key = st.speaker_key
       LEFT JOIN members m ON m.id = st.member_id
@@ -597,7 +638,7 @@ async function splitTurn(req, res) {
       `UPDATE speaker_turns
           SET raw_text = $2, word_times = $3::jsonb, end_ms = $4, confidence = $5,
               clean_text = NULL,
-              suggestions = jsonb_set(coalesce(suggestions, '{}'::jsonb), '{structural}', $6::jsonb, true)
+              suggestions = jsonb_set(coalesce(suggestions, '{}'::jsonb) - 'cleanup' - 'text_edits', '{structural}', $6::jsonb, true)
         WHERE id = $1`,
       [
         orig.id, textA, wtA ? JSON.stringify(wtA) : null,
@@ -711,7 +752,7 @@ async function mergeTurn(req, res) {
       `UPDATE speaker_turns
           SET raw_text = $2, word_times = $3::jsonb, clean_text = NULL,
               start_ms = $4, end_ms = $5, confidence = $6, attribution_status = 'edited',
-              suggestions = jsonb_set(coalesce(suggestions, '{}'::jsonb), '{structural}', $7::jsonb, true)
+              suggestions = jsonb_set(coalesce(suggestions, '{}'::jsonb) - 'cleanup' - 'text_edits', '{structural}', $7::jsonb, true)
         WHERE id = $1`,
       [
         target.id, merged, mergedWt ? JSON.stringify(mergedWt) : null,
@@ -791,6 +832,206 @@ async function insertTurn(req, res) {
   }
 }
 
+// ── POST /api/admin/hearings/:id/turns/:turnId/cleanup/accept ───────────────
+//  Accept one LLM proposal ({ edit_id }) or all auto-safe ones ({ all_safe }).
+//  RE-VALIDATES against the current raw_text and never trusts the stored class:
+//  a stale (raw_text changed) or blocked edit is refused, so nothing that would
+//  change a substantive word can reach clean_text.
+async function acceptCleanup(req, res) {
+  const { edit_id, all_safe } = req.body || {};
+  if (!edit_id && all_safe !== true) {
+    return res.status(400).json({ error: 'Provide edit_id or all_safe: true' });
+  }
+
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
+    const turn = await loadTurn(client, transcriptId, req.params.turnId);
+    if (!turn) return res.status(404).json({ error: 'Turn not found in this hearing' });
+
+    const cleanup = turn.suggestions?.cleanup;
+    if (!cleanup || !Array.isArray(cleanup.edits) || !cleanup.edits.length) {
+      return res.status(400).json({ error: 'No cleanup proposals on this turn' });
+    }
+    if (cleanup.raw_text_sha256 && cleanup.raw_text_sha256 !== sha256(turn.raw_text)) {
+      return res.status(409).json({ error: 'Cleanup proposals are stale (raw_text changed) — re-run the cleanup stage' });
+    }
+
+    let targets;
+    if (all_safe === true) {
+      targets = cleanup.edits.filter((e) => e.status === 'proposed' && isBulkAcceptable(e.class));
+    } else {
+      const e = cleanup.edits.find((x) => x.id === edit_id);
+      if (!e) return res.status(404).json({ error: 'Proposal not found on this turn' });
+      if (e.status !== 'proposed') return res.status(409).json({ error: `Proposal already ${e.status}` });
+      if (e.class === 'rejected') return res.status(422).json({ error: `This edit was blocked by the validator (${e.reject_reason}) and cannot be accepted` });
+      targets = [e];
+    }
+
+    const textEdits = Array.isArray(turn.suggestions?.text_edits) ? [...turn.suggestions.text_edits] : [];
+    let accepted = 0;
+    for (const e of targets) {
+      // Re-anchor by the stored `original` substring against the CURRENT
+      // raw_text — the numeric offset is only a hint. Unique match → apply
+      // there; gone or ambiguous → refuse cleanly, never guess a position.
+      const anchor = anchorEdit(turn.raw_text, e);
+      if (!anchor) {
+        if (all_safe === true) continue;
+        return res.status(409).json({ error: 'This proposal no longer matches the current text — re-run cleanup' });
+      }
+      // Re-validate against the anchored span — never trust the stored class.
+      const c = classifyEdit(e.original, e.replacement);
+      if (c.class === 'rejected') {
+        if (all_safe === true) continue;
+        return res.status(422).json({ error: `Re-validation blocked this edit: ${c.reason}` });
+      }
+      if (all_safe === true && !isBulkAcceptable(c.class)) continue;
+      if (!textEdits.some((t) => t.raw_start === anchor.raw_start && t.raw_end === anchor.raw_end)) {
+        textEdits.push({ source: 'llm', raw_start: anchor.raw_start, raw_end: anchor.raw_end, original: e.original, replacement: e.replacement, class: c.class, at: new Date().toISOString() });
+      }
+      e.status = 'accepted';
+      accepted++;
+    }
+
+    if (!accepted) return res.json({ data: { accepted: 0, demoted: false } });
+
+    await client.query('BEGIN');
+    try {
+      await persistTurnText(client, turn, { textEdits, cleanup, reviewedBy: req.user?.id });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `Edits overlap or do not reconstruct: ${err.message}` });
+    }
+    const demoted = await maybeDemote(client, req.params.id);
+    await client.query('COMMIT');
+    res.json({ data: { accepted, demoted } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+}
+
+// ── POST /api/admin/hearings/:id/turns/:turnId/cleanup/reject ────────────────
+//  Reject a proposal; revert its span to raw_text if it had been applied.
+async function rejectCleanup(req, res) {
+  const { edit_id } = req.body || {};
+  if (!edit_id) return res.status(400).json({ error: 'edit_id is required' });
+
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
+    const turn = await loadTurn(client, transcriptId, req.params.turnId);
+    if (!turn) return res.status(404).json({ error: 'Turn not found in this hearing' });
+
+    const cleanup = turn.suggestions?.cleanup;
+    if (!cleanup || !Array.isArray(cleanup.edits)) return res.status(400).json({ error: 'No cleanup proposals on this turn' });
+    const e = cleanup.edits.find((x) => x.id === edit_id);
+    if (!e) return res.status(404).json({ error: 'Proposal not found on this turn' });
+    e.status = 'rejected';
+
+    const textEdits = (Array.isArray(turn.suggestions?.text_edits) ? turn.suggestions.text_edits : [])
+      .filter((t) => !(t.source === 'llm' && t.raw_start === e.raw_start && t.raw_end === e.raw_end && t.replacement === e.replacement));
+
+    await client.query('BEGIN');
+    await persistTurnText(client, turn, { textEdits, cleanup, reviewedBy: req.user?.id });
+    const demoted = await maybeDemote(client, req.params.id);
+    await client.query('COMMIT');
+    res.json({ data: { demoted } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+}
+
+// ── POST /api/admin/hearings/:id/turns/:turnId/text ─────────────────────────
+//  Manual inline edit. The client sends the FULL new turn text; the server
+//  diffs it against raw_text to derive human edit spans (each recording its raw
+//  original), asserts they reconstruct the submitted text exactly, and
+//  recomputes clean_text. raw_text is never touched. Human edits are trusted
+//  (they may legitimately change a word) but always transparent and reversible.
+async function editTurnText(req, res) {
+  const { text } = req.body || {};
+  if (typeof text !== 'string') return res.status(400).json({ error: 'text (string) is required' });
+
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
+    const turn = await loadTurn(client, transcriptId, req.params.turnId);
+    if (!turn) return res.status(404).json({ error: 'Turn not found in this hearing' });
+
+    let textEdits;
+    if (text === turn.raw_text) {
+      textEdits = []; // reverted to the record
+    } else {
+      if (!text.trim().length) return res.status(400).json({ error: 'Use delete-merge to empty a turn, not a blank edit' });
+      const derived = diffToEdits(turn.raw_text, text);
+      let rebuilt = null;
+      try { rebuilt = applyEdits(turn.raw_text, derived); } catch { rebuilt = null; }
+      if (rebuilt !== text) return res.status(422).json({ error: 'Could not derive a faithful edit set for that text' });
+      const existing = Array.isArray(turn.suggestions?.text_edits) ? turn.suggestions.text_edits : [];
+      textEdits = derived.map((d) => {
+        const prior = existing.find((t) => t.raw_start === d.raw_start && t.raw_end === d.raw_end && t.replacement === d.replacement);
+        return prior ? { ...prior } : { source: 'human', raw_start: d.raw_start, raw_end: d.raw_end, original: d.original, replacement: d.replacement, at: new Date().toISOString() };
+      });
+    }
+
+    // Supersede any cleanup proposal a human edit now overlaps (keeps the tier gate clean).
+    const cleanup = turn.suggestions?.cleanup;
+    if (cleanup?.edits) {
+      for (const e of cleanup.edits) {
+        if (e.status === 'proposed' && textEdits.some((t) => spansOverlap(e, t))) e.status = 'superseded';
+      }
+    }
+
+    await client.query('BEGIN');
+    try {
+      await persistTurnText(client, turn, { textEdits, cleanup: cleanup ?? undefined, reviewedBy: req.user?.id });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `Edits overlap or do not reconstruct: ${err.message}` });
+    }
+    const demoted = await maybeDemote(client, req.params.id);
+    await client.query('COMMIT');
+    res.json({ data: { demoted, edits: textEdits.length } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+}
+
+// ── POST /api/admin/hearings/:id/turns/:turnId/text-review ───────────────────
+//  Mark a turn's text reviewed with no change ("looks good"). Feeds the tier-2 gate.
+async function reviewTurnText(req, res) {
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
+    const turn = await loadTurn(client, transcriptId, req.params.turnId);
+    if (!turn) return res.status(404).json({ error: 'Turn not found in this hearing' });
+    const sugg = { ...(turn.suggestions || {}) };
+    sugg.text_review = { reviewed_at: new Date().toISOString(), by: req.user?.id ?? null };
+    await client.query(`UPDATE speaker_turns SET suggestions = $2::jsonb, updated_at = now() WHERE id = $1`, [turn.id, JSON.stringify(sugg)]);
+    res.json({ data: { reviewed: true } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+}
+
 // ── POST /api/admin/hearings/:id/status ─────────────────────────────────────
 //  Tier promotion: attributed (tier 1) or verified (tier 2). Both hard-gated on
 //  every bucket being reviewed (no 'unverified' turn may reach the public).
@@ -823,6 +1064,29 @@ async function setStatus(req, res) {
       });
     }
 
+    // Tier-2 (human-verified) additionally requires the WORDS to be reviewed:
+    // every non-empty turn must be marked reviewed and carry no still-proposed
+    // cleanup edit. So "human-verified" means a person looked at speakers AND text.
+    if (status === 'verified') {
+      const { rows: textPending } = await client.query(
+        `SELECT 'Turn ' || seq AS label
+           FROM speaker_turns
+          WHERE transcript_id = $1 AND raw_text <> ''
+            AND ( NOT (suggestions ? 'text_review')
+               OR EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(suggestions->'cleanup'->'edits', '[]'::jsonb)) e
+                           WHERE e->>'status' = 'proposed') )
+          ORDER BY seq
+          LIMIT 15`,
+        [transcriptId]
+      );
+      if (textPending.length) {
+        return res.status(400).json({
+          error: 'Cannot mark human-verified: some turns still need text review (accept/reject their cleanup, or mark them reviewed)',
+          unresolved: textPending.map((r) => r.label),
+        });
+      }
+    }
+
     const { rowCount } = await client.query(
       `UPDATE hearings SET status = $2
         WHERE id = $1 AND status IN ('draft', 'attributed', 'verified')`,
@@ -842,4 +1106,5 @@ async function setStatus(req, res) {
 module.exports = {
   listAdminHearings, getReview, applySpeaker, overrideTurn,
   acceptAll, splitTurn, mergeTurn, insertTurn, setStatus,
+  acceptCleanup, rejectCleanup, editTurnText, reviewTurnText,
 };

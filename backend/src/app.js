@@ -70,6 +70,9 @@ app.use((err, req, res, next) => {
     return res.status(403).json({ error: 'CSRF validation failed' });
   }
   console.error(err);
+  // If a handler already started the response before rejecting, we cannot send
+  // again — delegate to Express's finalizer instead of throwing on a double-send.
+  if (res.headersSent) return next(err);
   res.status(500).json({ error: 'Internal server error' });
 });
 

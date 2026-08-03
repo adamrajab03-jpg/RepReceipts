@@ -265,6 +265,40 @@ export interface StructuralMarker {
   absorbed_distinct?: boolean
 }
 
+/** One LLM grammar-cleanup proposal (suggestions.cleanup.edits[]). `class` is
+ *  the validator's independent verdict; `rejected` edits are shown, not dropped. */
+export interface CleanupEdit {
+  id: string
+  original: string
+  replacement: string
+  llm_type: string
+  class: 'mechanical' | 'filler' | 'false_start' | 'transcription_error' | 'rejected'
+  reject_reason: string | null
+  raw_start: number
+  raw_end: number
+  status: 'proposed' | 'accepted' | 'rejected' | 'superseded'
+}
+
+export interface CleanupProposal {
+  provider: string
+  model: string
+  generated_at: string
+  raw_text_sha256: string
+  edits: CleanupEdit[]
+}
+
+/** One applied edit that derives clean_text (suggestions.text_edits[]). */
+export interface AppliedEdit {
+  source: 'llm' | 'human'
+  raw_start: number
+  raw_end: number
+  original: string
+  replacement: string
+  class?: CleanupEdit['class']
+  at: string
+  by?: string | null
+}
+
 export interface ReviewTurn {
   id: string
   seq: number
@@ -285,6 +319,14 @@ export interface ReviewTurn {
   suggestion: AttributionSuggestion | null
   pinned: boolean
   structural: StructuralMarker | null
+  /** Derived cleaned text (raw_text + accepted text_edits); null = show raw_text. */
+  clean_text: string | null
+  /** LLM cleanup proposals awaiting review, or null if the stage hasn't run. */
+  cleanup: CleanupProposal | null
+  /** Applied edits (accepted-LLM + human) that derive clean_text. */
+  text_edits: AppliedEdit[] | null
+  /** True once a human has reviewed this turn's words (feeds the tier-2 gate). */
+  text_reviewed: boolean
 }
 
 export interface ReviewData {

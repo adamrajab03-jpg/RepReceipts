@@ -1,11 +1,12 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef, type ReactNode } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import {
   useReview, useApplySpeaker, useOverrideTurn, useAcceptAll, useSetStatus,
   useSplitTurn, useMergeTurn, useInsertTurn,
+  useEditTurnText, useReviewTurnText, useAcceptCleanup, useRejectCleanup,
   type SpeakerDecision, type TurnDecision, type SplitPayload,
 } from '../hooks/useAdmin'
-import type { ReviewTurn, RosterMember } from '../types/api'
+import type { ReviewTurn, RosterMember, CleanupEdit, AppliedEdit } from '../types/api'
 import { makeSpeakerColors } from '../utils/speakerColors'
 import { tierBadge } from '../utils/hearingTier'
 import { cn } from '../utils/cn'
@@ -302,10 +303,109 @@ function SpeakerHeader({ info, roster, busy, onSpeaker }: {
   )
 }
 
+// ── Two-color hoverable diff ──────────────────────────────────────────────────
+// Applied edits show the CLEANED text (emerald = accepted LLM, violet = human);
+// still-proposed LLM edits show the ORIGINAL raw span marked up with inline
+// accept/reject; validator-`rejected` edits are shown flagged (red, no accept),
+// never silently dropped. Every marker hovers to reveal the original raw text.
+// Full literal class strings so Tailwind keeps them.
+const EDIT_STYLE = {
+  llm: 'bg-emerald-100 text-emerald-900',
+  human: 'bg-violet-100 text-violet-900',
+  mechanical: 'bg-sky-50 text-sky-900 decoration-sky-500',
+  filler: 'bg-sky-50 text-sky-900 decoration-sky-500',
+  false_start: 'bg-sky-50 text-sky-900 decoration-sky-500',
+  transcription_error: 'bg-amber-50 text-amber-900 decoration-amber-500',
+  rejected: 'bg-red-50 text-red-800 decoration-red-400',
+} as const
+
+function TurnBody({ turn, busy, onAccept, onReject }: {
+  turn: ReviewTurn
+  busy: boolean
+  onAccept: (editId: string) => void
+  onReject: (editId: string) => void
+}) {
+  const raw = turn.raw_text
+  const applied: AppliedEdit[] = turn.text_edits ?? []
+  const proposals: CleanupEdit[] = (turn.cleanup?.edits ?? []).filter(e => e.status === 'proposed')
+  const seam = turn.structural?.op === 'merge' ? turn.structural : null
+
+  // No text layer → keep the existing seam / plain rendering.
+  if (!applied.length && !proposals.length) {
+    if (seam && seam.seam_offset != null && seam.seam_offset > 0 && seam.seam_offset < raw.length) {
+      return (
+        <>
+          {raw.slice(0, seam.seam_offset)}
+          <span
+            title={`Merged ${seam.absorbed_side === 'before' ? 'start' : 'end'}: absorbed from ${seam.absorbed_name ?? seam.absorbed_key ?? 'deleted turn'}`}
+            className={cn('mx-0.5 select-none font-bold', seam.absorbed_distinct ? 'text-amber-600' : 'text-gray-300')}
+          >⌇</span>
+          {raw.slice(seam.seam_offset)}
+        </>
+      )
+    }
+    return <>{raw || <span className="italic text-gray-400">empty turn — add text with ✎, or delete-merge it</span>}</>
+  }
+
+  type Marker =
+    | { start: number; end: number; kind: 'applied'; e: AppliedEdit }
+    | { start: number; end: number; kind: 'proposal'; e: CleanupEdit }
+  const markers: Marker[] = applied.map(e => ({ start: e.raw_start, end: e.raw_end, kind: 'applied' as const, e }))
+  for (const p of proposals) {
+    if (markers.some(m => p.raw_start < m.end && m.start < p.raw_end)) continue // overlaps an applied edit → skip
+    markers.push({ start: p.raw_start, end: p.raw_end, kind: 'proposal', e: p })
+  }
+  markers.sort((a, b) => a.start - b.start || a.end - b.end)
+  const kept: Marker[] = []
+  let lastEnd = -1
+  for (const m of markers) { if (m.start >= lastEnd) { kept.push(m); lastEnd = m.end } }
+
+  const nodes: ReactNode[] = []
+  let cursor = 0
+  kept.forEach((m, i) => {
+    if (m.start > cursor) nodes.push(<span key={`t${i}`}>{raw.slice(cursor, m.start)}</span>)
+    if (m.kind === 'applied') {
+      const e = m.e
+      nodes.push(
+        e.replacement
+          ? <span key={`a${i}`} title={`${e.source === 'human' ? 'edited' : 'cleaned'} · original: "${e.original}"`}
+              className={cn('rounded-sm px-0.5 underline decoration-dotted underline-offset-2', EDIT_STYLE[e.source])}>{e.replacement}</span>
+          : <span key={`a${i}`} title={`removed (${e.source}): "${e.original}"`}
+              className={cn('px-0.5 font-bold', e.source === 'human' ? 'text-violet-500' : 'text-emerald-500')}>·</span>
+      )
+    } else {
+      const e = m.e
+      const rejected = e.class === 'rejected'
+      const tip = rejected
+        ? `BLOCKED (${e.class}): ${e.reject_reason ?? ''} — LLM wanted "${e.original}" → "${e.replacement}"`
+        : `LLM ${e.class}: "${e.original}" → "${e.replacement || '∅ (delete)'}"`
+      nodes.push(
+        <span key={`p${i}`} className="inline-flex items-baseline gap-0.5">
+          <span title={tip}
+            className={cn('rounded-sm px-0.5 underline decoration-dotted underline-offset-2 cursor-help',
+              EDIT_STYLE[e.class], !e.replacement && !rejected && 'line-through')}>
+            {e.original || '∅'}
+          </span>
+          {!rejected && (
+            <button onClick={() => onAccept(e.id)} disabled={busy} title="Accept this edit"
+              className="px-0.5 text-[11px] leading-none text-green-700 hover:text-green-900 disabled:opacity-40">✓</button>
+          )}
+          <button onClick={() => onReject(e.id)} disabled={busy}
+            title={rejected ? 'Dismiss this blocked suggestion' : 'Reject this edit'}
+            className="px-0.5 text-[11px] leading-none text-red-600 hover:text-red-800 disabled:opacity-40">✗</button>
+        </span>
+      )
+    }
+    cursor = m.end
+  })
+  if (cursor < raw.length) nodes.push(<span key="tail">{raw.slice(cursor)}</span>)
+  return <>{nodes}</>
+}
+
 // ── One transcript turn ───────────────────────────────────────────────────────
 type Panel = 'name' | 'split' | 'merge' | 'insert' | null
 
-function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, onTurn, onSplit, onMerge, onInsert }: {
+function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, onTurn, onSplit, onMerge, onInsert, onEditText, onAcceptEdit, onRejectEdit, onAcceptAllSafe, onMarkReviewed }: {
   turn: ReviewTurn
   colorCls: string
   roster: RosterMember[]
@@ -318,29 +418,47 @@ function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, 
   onSplit: (p: { word_index: number; assign: SplitPayload['assign'] }) => void
   onMerge: (direction: 'up' | 'down') => void
   onInsert: (position: 'before' | 'after') => void
+  onEditText: (text: string) => Promise<unknown>
+  onAcceptEdit: (editId: string) => void
+  onRejectEdit: (editId: string) => void
+  onAcceptAllSafe: () => void
+  onMarkReviewed: () => void
 }) {
   const [panel, setPanel] = useState<Panel>(autoOpen ? 'name' : null)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [saveErr, setSaveErr] = useState<string | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
   const pending = turn.attribution_status === 'unverified'
   const sug = turn.suggestion?.suggested_identity
   const resolved = turn.member_full_name ?? turn.speaker_name
   const pendingName = sug?.type === 'unknown' ? 'Unknown' : (sug?.display_name ?? ordinalLabel(turn.speaker_ordinal))
   const canSplit = (turn.word_times?.length ?? 0) >= 2
-  const seam = turn.structural?.op === 'merge' ? turn.structural : null
 
   const toggle = (p: Panel) => setPanel(cur => (cur === p ? null : p))
   const nameBtnCls = 'underline decoration-dotted underline-offset-2 hover:decoration-solid'
 
-  // Body text: mark the merge seam so absorbed words stay visible for review.
-  const body = seam && seam.seam_offset != null && seam.seam_offset > 0 && seam.seam_offset < turn.raw_text.length ? (
-    <>
-      {turn.raw_text.slice(0, seam.seam_offset)}
-      <span
-        title={`Merged ${seam.absorbed_side === 'before' ? 'start' : 'end'}: absorbed from ${seam.absorbed_name ?? seam.absorbed_key ?? 'deleted turn'}`}
-        className={cn('mx-0.5 select-none font-bold', seam.absorbed_distinct ? 'text-amber-600' : 'text-gray-300')}
-      >⌇</span>
-      {turn.raw_text.slice(seam.seam_offset)}
-    </>
-  ) : (turn.raw_text || <span className="italic text-gray-400">empty turn — add text in the next slice, or delete-merge it</span>)
+  // Text editing: prefilled with the current cleaned reading; on save the server
+  // diffs the submitted text against the immutable raw_text. We read the LIVE
+  // textarea value at save time (never a stale closure), send it unconditionally
+  // (no equality guard), and keep the editor open + show the error on failure so
+  // the edit is never silently lost.
+  const currentText = turn.clean_text ?? turn.raw_text
+  const dirty = draft !== currentText
+  const startEdit = () => { setDraft(currentText); setSaveErr(null); setPanel(null); setEditing(true) }
+  const save = async () => {
+    const value = textareaRef.current?.value ?? draft
+    setSaveErr(null); setSaving(true)
+    try { await onEditText(value); setEditing(false) }
+    catch (e) { setSaveErr(e instanceof Error ? e.message : 'Save failed') }
+    finally { setSaving(false) }
+  }
+
+  const proposed = (turn.cleanup?.edits ?? []).filter(e => e.status === 'proposed')
+  const safeCount = proposed.filter(e => e.class === 'mechanical' || e.class === 'filler' || e.class === 'false_start').length
+  const transCount = proposed.filter(e => e.class === 'transcription_error').length
+  const rejectedCount = proposed.filter(e => e.class === 'rejected').length
 
   return (
     <div className={cn('group border-l-4 pl-3 pr-2 py-2.5', colorCls, turn.pinned && 'ring-1 ring-inset ring-amber-400/70 rounded-r')}>
@@ -365,7 +483,9 @@ function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, 
         )}
 
         <span className="ml-auto flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
-          {/* Reserved slot for the next slice's inline text-edit control. */}
+          <button onClick={startEdit} disabled={busy}
+            title="Edit this turn's text (raw_text stays canonical)"
+            className="px-1.5 py-0.5 rounded text-slate-500 hover:text-violet-700 hover:bg-violet-50 disabled:opacity-30">✎</button>
           <button onClick={() => canSplit && toggle('split')} disabled={busy || !canSplit}
             title={canSplit ? 'Split this turn at a word' : 'No word timing — cannot split'}
             className="px-1.5 py-0.5 rounded text-slate-500 hover:text-sky-700 hover:bg-sky-50 disabled:opacity-30">✂</button>
@@ -378,7 +498,60 @@ function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, 
         </span>
       </div>
 
-      <p className="mt-1 text-sm text-gray-700 leading-relaxed">{body}</p>
+      {editing ? (
+        <div className="mt-1">
+          <textarea
+            ref={textareaRef}
+            autoFocus value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); if (dirty) void save() }
+              if (e.key === 'Escape') { e.preventDefault(); setEditing(false) }
+            }}
+            rows={Math.min(8, Math.max(2, Math.ceil((draft.length + 1) / 80)))}
+            className="w-full text-sm p-2 rounded-md border border-violet-300 focus:outline-none focus:ring-2 focus:ring-violet-400"
+          />
+          <div className="mt-1 flex flex-wrap items-center gap-3 text-xs">
+            <button onClick={() => void save()} disabled={!dirty || saving}
+              className="px-2 py-1 rounded bg-violet-600 text-white hover:bg-violet-500 disabled:opacity-50">
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+            <button onClick={() => setDraft(turn.raw_text)} disabled={saving}
+              className="text-gray-500 hover:text-gray-700 underline disabled:opacity-50">Reset to raw</button>
+            <button onClick={() => setEditing(false)} disabled={saving}
+              className="text-gray-500 hover:text-gray-700 underline disabled:opacity-50">Cancel</button>
+            {dirty && !saving && <span className="text-violet-600">● unsaved changes</span>}
+            {saveErr
+              ? <span className="text-red-600">Save failed: {saveErr}</span>
+              : <span className="text-gray-400">raw_text is preserved — every edit is reversible</span>}
+          </div>
+        </div>
+      ) : (
+        <>
+          <p className="mt-1 text-sm text-gray-700 leading-relaxed">
+            <TurnBody turn={turn} busy={busy} onAccept={onAcceptEdit} onReject={onRejectEdit} />
+          </p>
+          {(proposed.length > 0 || !turn.text_reviewed) && (
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
+              {safeCount > 0 && (
+                <button onClick={onAcceptAllSafe} disabled={busy}
+                  className="px-1.5 py-0.5 rounded bg-sky-600 text-white hover:bg-sky-500 disabled:opacity-50">
+                  Accept {safeCount} safe edit{safeCount > 1 ? 's' : ''}
+                </button>
+              )}
+              {(safeCount + transCount) > 0 && (
+                <span className="text-gray-500">
+                  {safeCount + transCount} proposed{transCount ? ` (${transCount} ASR-fix — needs your call)` : ''}
+                </span>
+              )}
+              {rejectedCount > 0 && <span className="text-red-600">{rejectedCount} blocked by validator</span>}
+              {!turn.text_reviewed
+                ? <button onClick={onMarkReviewed} disabled={busy} className="ml-auto text-slate-500 hover:text-slate-700 underline">Mark reviewed</button>
+                : <span className="ml-auto text-green-600">✓ text reviewed</span>}
+            </div>
+          )}
+        </>
+      )}
 
       {panel === 'name' && (
         <TurnAssign turn={turn} buckets={buckets} roster={roster}
@@ -466,6 +639,10 @@ export default function ReviewWorkbenchPage() {
   const insertTurn = useInsertTurn(id)
   const acceptAll = useAcceptAll(id)
   const setStatus = useSetStatus(id)
+  const acceptCleanup = useAcceptCleanup(id)
+  const rejectCleanup = useRejectCleanup(id)
+  const editTurnText = useEditTurnText(id)
+  const reviewTurnText = useReviewTurnText(id)
 
   const [notice, setNotice] = useState<string | null>(null)
   const [confirmVerify, setConfirmVerify] = useState(false)
@@ -489,6 +666,7 @@ export default function ReviewWorkbenchPage() {
   const reviewed = totalSpeakers - pendingSpeakers
   const busy = applySpeaker.isPending || overrideTurn.isPending || splitTurn.isPending
     || mergeTurn.isPending || insertTurn.isPending || acceptAll.isPending || setStatus.isPending
+    || acceptCleanup.isPending || rejectCleanup.isPending || editTurnText.isPending || reviewTurnText.isPending
   const badge = tierBadge(hearing.status)
   const verifyErr = setStatus.error as (Error & { unresolved?: string[] }) | null
 
@@ -599,6 +777,17 @@ export default function ReviewWorkbenchPage() {
                 onInsert={(position) => insertTurn.mutate({ turnId: turn.id, position }, {
                   onSuccess: (r) => { flagDemotion(r); setAutoOpenId(r.new_turn_id) },
                 })}
+                onEditText={(text) => editTurnText.mutateAsync({ turnId: turn.id, text }).then(flagDemotion)}
+                onAcceptEdit={(edit_id) => acceptCleanup.mutate({ turnId: turn.id, edit_id }, {
+                  onSuccess: flagDemotion,
+                  onError: (e) => setNotice((e as Error).message),
+                })}
+                onRejectEdit={(edit_id) => rejectCleanup.mutate({ turnId: turn.id, edit_id }, { onSuccess: flagDemotion })}
+                onAcceptAllSafe={() => acceptCleanup.mutate({ turnId: turn.id, all_safe: true }, {
+                  onSuccess: flagDemotion,
+                  onError: (e) => setNotice((e as Error).message),
+                })}
+                onMarkReviewed={() => reviewTurnText.mutate({ turnId: turn.id })}
               />
             </div>
           )

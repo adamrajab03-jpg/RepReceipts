@@ -148,6 +148,71 @@ export function useInsertTurn(hearingId: string) {
   })
 }
 
+// ── Manual inline text edit (Part A) ────────────────────────────────────────
+export function useEditTurnText(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ turnId, text }: { turnId: string; text: string }): Promise<Demotable & { edits: number }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/text`, {
+        method: 'POST',
+        body: JSON.stringify({ text }),
+      })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.error ?? 'Text edit failed')
+      return body.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+// ── Mark a turn's text reviewed with no change ("looks good") ────────────────
+export function useReviewTurnText(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ turnId }: { turnId: string }): Promise<{ reviewed: boolean }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/text-review`, { method: 'POST' })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.error ?? 'Mark-reviewed failed')
+      return body.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+// ── Accept an LLM cleanup proposal (re-validated server-side at accept time) ─
+export type AcceptCleanupVars = { turnId: string } & ({ edit_id: string } | { all_safe: true })
+export function useAcceptCleanup(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ turnId, ...payload }: AcceptCleanupVars): Promise<Demotable & { accepted: number }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/cleanup/accept`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.error ?? 'Accept failed')
+      return body.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+export function useRejectCleanup(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ turnId, edit_id }: { turnId: string; edit_id: string }): Promise<Demotable> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/cleanup/reject`, {
+        method: 'POST',
+        body: JSON.stringify({ edit_id }),
+      })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.error ?? 'Reject failed')
+      return body.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
 // ── Attribute every pending speaker ─────────────────────────────────────────
 export function useAcceptAll(hearingId: string) {
   const invalidate = useInvalidate(hearingId)

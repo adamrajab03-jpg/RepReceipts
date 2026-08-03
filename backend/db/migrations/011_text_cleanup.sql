@@ -1,0 +1,46 @@
+-- ============================================================================
+--  Text editing + LLM grammar cleanup — suggestions sub-keys (documentation)
+-- ----------------------------------------------------------------------------
+--  No DDL required: clean_text, is_edited, edited_by, and suggestions (jsonb)
+--  all already exist (001_initial_schema, 008_speaker_suggestions). This
+--  migration documents the sub-keys this slice adds under speaker_turns.suggestions.
+--
+--  BOUNDARY: the cleanup pipeline (ingestion/cleanup.js) writes ONLY
+--  suggestions.cleanup. clean_text is DERIVED — clean_text = raw_text with the
+--  applied suggestions.text_edits spliced in — and is written only by the admin
+--  review flow when a human accepts an edit or edits text directly. raw_text is
+--  never mutated by anything after ingestion.
+--
+--  suggestions sub-keys (all optional, per speaker_turn):
+--
+--    cleanup = {
+--      provider, model, generated_at,
+--      raw_text_sha256,                 -- binds proposals to the exact raw_text
+--      edits: [ {
+--        id, original, replacement,
+--        llm_type,                      -- the model's declared type (advisory only)
+--        class,                         -- the VALIDATOR's verdict, authoritative:
+--                                       --   mechanical | filler | false_start
+--                                       --   | transcription_error | rejected
+--        reject_reason,                 -- set when class = 'rejected' (shown, not dropped)
+--        raw_start, raw_end,
+--        status                         -- proposed | accepted | rejected | superseded
+--      } ]
+--    }
+--      LLM proposals; nothing here is authoritative. Re-validated at accept time
+--      against the current raw_text (src/utils/cleanupValidate.js). Structural
+--      edits (split/merge) strip this key — the halves/merged turn must re-clean.
+--
+--    text_edits = [ { source: 'llm'|'human', raw_start, raw_end,
+--                     original, replacement, class?, at, by? } ]
+--      The applied edits that DERIVE clean_text. Each records its raw original,
+--      so every edit is hover-revealable and reversible. Structural edits strip
+--      this key (and clean_text) so stale offsets can never be applied.
+--
+--    text_review = { reviewed_at, by }
+--      A human reviewed this turn's words. Tier-2 ('verified') promotion requires
+--      every non-empty turn to carry this AND have no still-'proposed' cleanup
+--      edit — so "human-verified" now means a person looked at speakers AND text.
+-- ============================================================================
+
+SELECT 1;  -- documentation-only migration; no schema change
