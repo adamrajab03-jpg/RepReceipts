@@ -276,7 +276,12 @@ export interface CleanupEdit {
   reject_reason: string | null
   raw_start: number
   raw_end: number
+  /** 'rejected' = dismissed by a human (recoverable — the edit object is kept). */
   status: 'proposed' | 'accepted' | 'rejected' | 'superseded'
+  /** Stamped when dismissed; kept even after a restore, so the trip is auditable. */
+  dismissed?: { at: string; by: string | null } | null
+  /** Stamped when a dismissal was undone. */
+  restored?: { at: string; by: string | null } | null
 }
 
 export interface CleanupProposal {
@@ -297,6 +302,29 @@ export interface AppliedEdit {
   class?: CleanupEdit['class']
   at: string
   by?: string | null
+  /**
+   * Accepted LLM cleanup edits this human edit overwrote. A manual edit that
+   * lands on top of accepted cleanup becomes human-authored, but the machine
+   * origin it replaced is kept here so the record stays complete.
+   */
+  supersedes?: {
+    source: 'llm'
+    class: CleanupEdit['class'] | null
+    original: string
+    replacement: string
+    at: string | null
+  }[]
+  /**
+   * Set when an admin applied a validator-BLOCKED suggestion's text as their
+   * own edit. Always accompanies source:'human' — a blocked change is never
+   * recorded as an AI cleanup, so overriding the block transfers ownership.
+   */
+  override?: {
+    at: string
+    by: string | null
+    blocked_reason: string | null
+    cleanup_edit_id: string
+  } | null
 }
 
 export interface ReviewTurn {

@@ -13,6 +13,8 @@ const {
   setStatus,
   acceptCleanup,
   rejectCleanup,
+  restoreCleanup,
+  overrideCleanup,
   editTurnText,
   reviewTurnText,
 } = require('../controllers/adminController');
@@ -35,7 +37,9 @@ router.post('/hearings/:id/turns/:turnId/insert', asyncHandler(insertTurn)); // 
 router.post('/hearings/:id/turns/:turnId/text',   asyncHandler(editTurnText));   // manual inline text edit
 router.post('/hearings/:id/turns/:turnId/text-review', asyncHandler(reviewTurnText)); // mark text reviewed (no change)
 router.post('/hearings/:id/turns/:turnId/cleanup/accept', asyncHandler(acceptCleanup)); // accept LLM cleanup proposal(s)
-router.post('/hearings/:id/turns/:turnId/cleanup/reject', asyncHandler(rejectCleanup)); // reject an LLM cleanup proposal
+router.post('/hearings/:id/turns/:turnId/cleanup/reject', asyncHandler(rejectCleanup));  // dismiss one / all pending (recoverable)
+router.post('/hearings/:id/turns/:turnId/cleanup/restore', asyncHandler(restoreCleanup)); // undo a dismissal
+router.post('/hearings/:id/turns/:turnId/cleanup/override', asyncHandler(overrideCleanup)); // apply a BLOCKED edit as a human edit
 router.post('/hearings/:id/accept-all',    asyncHandler(acceptAll));       // attribute all pending speakers
 router.post('/hearings/:id/status',        asyncHandler(setStatus));       // tier: attributed | verified
 

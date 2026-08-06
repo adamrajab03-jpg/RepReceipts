@@ -152,10 +152,13 @@ export function useInsertTurn(hearingId: string) {
 export function useEditTurnText(hearingId: string) {
   const invalidate = useInvalidate(hearingId)
   return useMutation({
-    mutationFn: async ({ turnId, text }: { turnId: string; text: string }): Promise<Demotable & { edits: number }> => {
+    // `base` is the cleaned text the editor was opened on. The server composes
+    // the change onto the existing edit stack relative to it, and 409s if an
+    // edit was accepted/dismissed meanwhile rather than diffing a stale baseline.
+    mutationFn: async ({ turnId, text, base }: { turnId: string; text: string; base: string }): Promise<Demotable & { edits: number }> => {
       const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/text`, {
         method: 'POST',
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, base }),
       })
       const body = await res.json()
       if (!res.ok) throw new Error(body.error ?? 'Text edit failed')
@@ -197,16 +200,56 @@ export function useAcceptCleanup(hearingId: string) {
   })
 }
 
+// ── Dismiss cleanup proposals — recoverable, never a hard delete ─────────────
+// One edit, or every still-pending edit on the turn. Dismissed suggestions keep
+// living in suggestions.cleanup (status 'rejected') and can be restored.
+export type RejectCleanupVars = { turnId: string } & ({ edit_id: string } | { all_pending: true })
 export function useRejectCleanup(hearingId: string) {
   const invalidate = useInvalidate(hearingId)
   return useMutation({
-    mutationFn: async ({ turnId, edit_id }: { turnId: string; edit_id: string }): Promise<Demotable> => {
+    mutationFn: async ({ turnId, ...payload }: RejectCleanupVars): Promise<Demotable & { dismissed: number }> => {
       const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/cleanup/reject`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.error ?? 'Dismiss failed')
+      return body.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+// ── Apply a BLOCKED suggestion's text as the admin's own human edit ─────────
+// Never produces an llm edit: the validator blocked the change as a meaning
+// change, so the human who overrides that block owns the result (violet).
+export function useOverrideCleanup(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ turnId, edit_id }: { turnId: string; edit_id: string }): Promise<Demotable & { applied: number }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/cleanup/override`, {
         method: 'POST',
         body: JSON.stringify({ edit_id }),
       })
       const body = await res.json()
-      if (!res.ok) throw new Error(body.error ?? 'Reject failed')
+      if (!res.ok) throw new Error(body.error ?? 'Override failed')
+      return body.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+// ── Undo a dismissal — puts the suggestion back in the pending queue ─────────
+export function useRestoreCleanup(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ turnId, edit_id }: { turnId: string; edit_id: string }): Promise<Demotable & { restored: number }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/turns/${turnId}/cleanup/restore`, {
+        method: 'POST',
+        body: JSON.stringify({ edit_id }),
+      })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.error ?? 'Restore failed')
       return body.data
     },
     onSuccess: invalidate,

@@ -1,9 +1,13 @@
-import { useState, useMemo, useRef, type ReactNode } from 'react'
+import {
+  useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback,
+  type ReactNode, type MouseEvent as ReactMouseEvent,
+} from 'react'
+import { createPortal } from 'react-dom'
 import { useParams, Link } from 'react-router-dom'
 import {
   useReview, useApplySpeaker, useOverrideTurn, useAcceptAll, useSetStatus,
   useSplitTurn, useMergeTurn, useInsertTurn,
-  useEditTurnText, useReviewTurnText, useAcceptCleanup, useRejectCleanup,
+  useEditTurnText, useReviewTurnText, useAcceptCleanup, useRejectCleanup, useRestoreCleanup, useOverrideCleanup,
   type SpeakerDecision, type TurnDecision, type SplitPayload,
 } from '../hooks/useAdmin'
 import type { ReviewTurn, RosterMember, CleanupEdit, AppliedEdit } from '../types/api'
@@ -307,7 +311,9 @@ function SpeakerHeader({ info, roster, busy, onSpeaker }: {
 // Applied edits show the CLEANED text (emerald = accepted LLM, violet = human);
 // still-proposed LLM edits show the ORIGINAL raw span marked up with inline
 // accept/reject; validator-`rejected` edits are shown flagged (red, no accept),
-// never silently dropped. Every marker hovers to reveal the original raw text.
+// never silently dropped. Applied edits hover to a styled card with the original
+// raw text (see EditHoverCard); proposals keep the compact native tip since the
+// span they mark up already IS the original.
 // Full literal class strings so Tailwind keeps them.
 const EDIT_STYLE = {
   llm: 'bg-emerald-100 text-emerald-900',
@@ -319,16 +325,243 @@ const EDIT_STYLE = {
   rejected: 'bg-red-50 text-red-800 decoration-red-400',
 } as const
 
-function TurnBody({ turn, busy, onAccept, onReject }: {
+// ── Hover card: review one edit without leaving the transcript ────────────────
+// Replaces the native `title` tooltip on EVERY marked span — instant instead of
+// the ~1s OS delay, readable width, and tinted to match the span it belongs to:
+//
+//   applied edit     → the ORIGINAL raw text behind the cleaned reading
+//                      (emerald = accepted LLM cleanup, violet = human edit)
+//   pending proposal → ORIGINAL vs PROPOSED side by side + the validator class,
+//                      with accept / remove-suggestion actions in the card
+//                      (sky = auto-safe, amber = ASR fix, red = blocked)
+//
+// Portalled to <body> as a fixed element so the transcript container can never
+// clip it. The proposal card is INTERACTIVE, so dismissal is delayed by
+// HOVER_CLOSE_MS and cancelled while the pointer is over the card — the cursor
+// can cross the gap from span to button without the card vanishing.
+//
+// v1 shows the edited span only. Surrounding-sentence context would slot in
+// under the compare block — an extra field on HoverTarget, no caller changes.
+type HoverTarget =
+  | { kind: 'applied'; e: AppliedEdit }
+  | { kind: 'proposal'; e: CleanupEdit }
+
+interface HoverCard {
+  /** Viewport rect of the hovered span, measured on mouseenter. */
+  rect: DOMRect
+  target: HoverTarget
+}
+
+const TINT_SKY = { card: 'border-sky-300 bg-sky-50', label: 'text-sky-800', tag: 'text-sky-600', bar: 'border-sky-300' }
+const CARD_TINT: Record<AppliedEdit['source'] | CleanupEdit['class'], typeof TINT_SKY> = {
+  llm: { card: 'border-emerald-300 bg-emerald-50', label: 'text-emerald-800', tag: 'text-emerald-600', bar: 'border-emerald-300' },
+  human: { card: 'border-violet-300 bg-violet-50', label: 'text-violet-800', tag: 'text-violet-600', bar: 'border-violet-300' },
+  mechanical: TINT_SKY,
+  filler: TINT_SKY,
+  false_start: TINT_SKY,
+  transcription_error: { card: 'border-amber-300 bg-amber-50', label: 'text-amber-800', tag: 'text-amber-600', bar: 'border-amber-300' },
+  rejected: { card: 'border-red-300 bg-red-50', label: 'text-red-800', tag: 'text-red-600', bar: 'border-red-300' },
+}
+
+// What the validator's class means, in the reviewer's language.
+const CLASS_GLOSS: Record<CleanupEdit['class'], string> = {
+  mechanical: 'Punctuation, capitalization or whitespace only — no word changed.',
+  filler: 'Removes a filler word (um, uh…). No content word changed.',
+  false_start: 'Removes a verbatim repeat (stutter / self-repair).',
+  transcription_error: 'Swaps one content word — a plausible ASR mishearing. Your call.',
+  rejected: 'Blocked by the validator — this suggestion cannot be accepted.',
+}
+
+// Each TurnBody owns its own hover state, but only ONE card may be open across
+// the transcript: opening one dismisses whatever else is still lingering inside
+// its close delay, so sweeping between turns never stacks two cards.
+let dismissOpenCard: (() => void) | null = null
+
+const CARD_W = 320       // applied edit: enough for a phrase-length original
+const CARD_W_WIDE = 400  // proposal: two readable columns side by side
+const CARD_GAP = 8       // space between the span and the card
+const EDGE = 8           // min distance from any viewport edge
+const HOVER_CLOSE_MS = 220 // grace period to cross from the span onto the card
+
+function EditHoverCard({ card, busy, onAccept, onReject, onOverride, onHold, onRelease, onClose }: {
+  card: HoverCard
+  busy: boolean
+  onAccept: (editId: string) => void
+  onReject: (editId: string) => void
+  /** Apply a blocked suggestion's text as the admin's own human edit. */
+  onOverride: (editId: string) => void
+  /** Pointer entered the card — cancel the pending close. */
+  onHold: () => void
+  /** Pointer left the card — schedule the close. */
+  onRelease: () => void
+  onClose: () => void
+}) {
+  const ref = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+  const { target } = card
+  const proposal = target.kind === 'proposal' ? target.e : null
+  // The validator's own verdict is the only gate: `rejected` can never be applied.
+  const blocked = proposal?.class === 'rejected'
+  const tint = CARD_TINT[target.kind === 'applied' ? target.e.source : target.e.class] ?? TINT_SKY
+  const width = Math.min(proposal ? CARD_W_WIDE : CARD_W, window.innerWidth - EDGE * 2)
+
+  // Measure first, then place: sit above the span, flip below when the card
+  // would clip the top, and clamp sideways so spans near either edge stay whole.
+  // useLayoutEffect runs before paint, so the pre-measure position never shows.
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const h = el.offsetHeight
+    const { innerWidth: vw, innerHeight: vh } = window
+    const fitsAbove = card.rect.top - h - CARD_GAP >= EDGE
+    const top = fitsAbove ? card.rect.top - h - CARD_GAP : Math.min(card.rect.bottom + CARD_GAP, vh - h - EDGE)
+    const left = Math.min(card.rect.left + card.rect.width / 2 - width / 2, vw - width - EDGE)
+    setPos({ top: Math.max(EDGE, top), left: Math.max(EDGE, left) })
+  }, [card, width])
+
+  // Fixed positioning would drift away from the span, so any scroll dismisses.
+  useEffect(() => {
+    window.addEventListener('scroll', onClose, true)
+    return () => window.removeEventListener('scroll', onClose, true)
+  }, [onClose])
+
+  const boxCls = 'mt-0.5 rounded border bg-white px-1.5 py-1 text-sm leading-snug text-slate-800 whitespace-pre-wrap break-words'
+  const capCls = 'text-[10px] font-semibold uppercase tracking-wide'
+
+  return createPortal(
+    <div
+      ref={ref} role={proposal ? 'group' : 'tooltip'}
+      onMouseEnter={onHold} onMouseLeave={onRelease}
+      style={{ top: pos?.top ?? 0, left: pos?.left ?? 0, width, visibility: pos ? 'visible' : 'hidden' }}
+      className={cn('fixed z-50 rounded-lg border shadow-lg p-2.5', tint.card, !proposal && 'pointer-events-none')}
+    >
+      {proposal ? (
+        <>
+          <div className="flex items-baseline gap-2">
+            <span className={cn(capCls, tint.label)}>{blocked ? 'Blocked suggestion' : 'Pending suggestion'}</span>
+            <span className={cn('ml-auto font-mono text-[10px]', tint.tag)}>{proposal.class}</span>
+          </div>
+
+          {/* Original vs proposed, side by side — the comparison IS the review. */}
+          <div className="mt-1.5 grid grid-cols-2 gap-2">
+            <div className="min-w-0">
+              <p className={cn(capCls, 'text-gray-500')}>Original</p>
+              <p className={cn(boxCls, 'border-gray-200')}>
+                {proposal.original || <span className="italic text-gray-400">(empty)</span>}
+              </p>
+            </div>
+            <div className="min-w-0">
+              <p className={cn(capCls, tint.label)}>Proposed</p>
+              <p className={cn(boxCls, tint.bar)}>
+                {proposal.replacement || <span className="italic text-gray-400">(deleted)</span>}
+              </p>
+            </div>
+          </div>
+
+          <p className={cn('mt-1.5 text-[11px] leading-snug', blocked ? 'text-red-700' : 'text-gray-600')}>
+            {blocked && proposal.reject_reason ? proposal.reject_reason : CLASS_GLOSS[proposal.class]}
+          </p>
+
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => { onClose(); onAccept(proposal.id) }}
+              disabled={busy || blocked}
+              title={blocked ? 'The validator blocked this edit — it cannot be accepted' : 'Apply this edit to the cleaned reading'}
+              className="px-2 py-1 rounded text-[11px] font-medium bg-green-600 text-white hover:bg-green-500 disabled:opacity-40 disabled:cursor-not-allowed"
+            >✓ Accept</button>
+            {blocked && (
+              // The guardrail stays absolute — there is no "accept anyway", and
+              // no path that records a blocked change as an AI cleanup. This
+              // applies the same text as YOUR edit: violet, owned by you.
+              <button
+                onClick={() => { onClose(); onOverride(proposal.id) }}
+                disabled={busy}
+                title="Apply this replacement as your own human edit — recorded as an admin override of the validator block, never as an AI cleanup"
+                className="px-2 py-1 rounded text-[11px] font-medium bg-violet-600 text-white hover:bg-violet-500 disabled:opacity-40"
+              >Apply as my edit</button>
+            )}
+            <button
+              onClick={() => { onClose(); onReject(proposal.id) }}
+              disabled={busy}
+              title="Dismiss this suggestion — the text stays exactly as spoken, and you can restore it from the turn's dismissed list"
+              className="px-2 py-1 rounded text-[11px] font-medium border border-gray-300 bg-white text-slate-600 hover:bg-gray-50 hover:text-red-700 disabled:opacity-40"
+            >Remove suggestion</button>
+            {!blocked && <span className="ml-auto text-[10px] text-gray-400">recoverable</span>}
+          </div>
+        </>
+      ) : target.kind === 'applied' && (
+        <>
+          <div className="flex items-baseline gap-2">
+            <span className={cn(capCls, tint.label)}>{target.e.replacement ? 'Original:' : 'Removed:'}</span>
+            <span className={cn('ml-auto text-[10px]', tint.tag)}>
+              {target.e.source === 'human' ? (target.e.override ? 'human override' : 'manual edit') : 'LLM cleanup'}
+            </span>
+          </div>
+          <p className={cn('mt-1 rounded-r border-l-2 bg-white/80 py-1 pl-2 pr-1 text-sm leading-snug text-slate-800 whitespace-pre-wrap break-words', tint.bar)}>
+            {target.e.original || <span className="italic text-gray-400">(nothing — this text was inserted)</span>}
+          </p>
+          {/* An override of a validator block is stated plainly — the human made
+              this call against the guardrail, and the record says so. */}
+          {target.e.override ? (
+            <p className="mt-1.5 text-[10px] leading-snug text-violet-700">
+              Human override of a blocked edit
+              {target.e.override.blocked_reason ? <>: <span className="text-violet-600">{target.e.override.blocked_reason}</span></> : null}
+            </p>
+          ) : null}
+          {/* A manual edit written over accepted cleanup keeps that origin visible. */}
+          {target.e.supersedes?.length ? (
+            <p className="mt-1.5 text-[10px] leading-snug text-gray-500">
+              Written over an accepted LLM {target.e.supersedes[0].class ?? 'cleanup'} edit:{' '}
+              <span className="text-gray-600">“{target.e.supersedes[0].original}” → “{target.e.supersedes[0].replacement}”</span>
+              {target.e.supersedes.length > 1 && ` (+${target.e.supersedes.length - 1} more)`}
+            </p>
+          ) : null}
+        </>
+      )}
+    </div>,
+    document.body,
+  )
+}
+
+function TurnBody({ turn, busy, onAccept, onReject, onOverride }: {
   turn: ReviewTurn
   busy: boolean
   onAccept: (editId: string) => void
   onReject: (editId: string) => void
+  onOverride: (editId: string) => void
 }) {
   const raw = turn.raw_text
   const applied: AppliedEdit[] = turn.text_edits ?? []
   const proposals: CleanupEdit[] = (turn.cleanup?.edits ?? []).filter(e => e.status === 'proposed')
   const seam = turn.structural?.op === 'merge' ? turn.structural : null
+
+  // One card at a time — only one span can be hovered. Opens with no delay;
+  // closing is deferred so the pointer can travel onto the card's buttons.
+  const [hover, setHover] = useState<HoverCard | null>(null)
+  const closeTimer = useRef<number | null>(null)
+  const holdCard = useCallback(() => {
+    if (closeTimer.current !== null) { clearTimeout(closeTimer.current); closeTimer.current = null }
+  }, [])
+  const closeCard = useCallback(() => { holdCard(); setHover(null) }, [holdCard])
+  const releaseCard = useCallback(() => {
+    holdCard()
+    closeTimer.current = window.setTimeout(() => setHover(null), HOVER_CLOSE_MS)
+  }, [holdCard])
+  useEffect(() => holdCard, [holdCard]) // never leave a timer running past unmount
+
+  // Attached to every marked span — applied edits AND pending proposals, so no
+  // marker is ever hoverable-looking but card-less.
+  const cardProps = (target: HoverTarget, label: string) => ({
+    onMouseEnter: (ev: ReactMouseEvent<HTMLElement>) => {
+      dismissOpenCard?.()          // no-op when the open card is already ours
+      dismissOpenCard = closeCard
+      holdCard()
+      setHover({ rect: ev.currentTarget.getBoundingClientRect(), target })
+    },
+    onMouseLeave: releaseCard,
+    // The card is mouse-only, so keep the detail reachable for screen readers.
+    'aria-label': label,
+  })
 
   // No text layer → keep the existing seam / plain rendering.
   if (!applied.length && !proposals.length) {
@@ -366,22 +599,21 @@ function TurnBody({ turn, busy, onAccept, onReject }: {
     if (m.start > cursor) nodes.push(<span key={`t${i}`}>{raw.slice(cursor, m.start)}</span>)
     if (m.kind === 'applied') {
       const e = m.e
+      const label = `${e.replacement ? 'edited' : 'removed'} — original: ${e.original}`
       nodes.push(
         e.replacement
-          ? <span key={`a${i}`} title={`${e.source === 'human' ? 'edited' : 'cleaned'} · original: "${e.original}"`}
-              className={cn('rounded-sm px-0.5 underline decoration-dotted underline-offset-2', EDIT_STYLE[e.source])}>{e.replacement}</span>
-          : <span key={`a${i}`} title={`removed (${e.source}): "${e.original}"`}
-              className={cn('px-0.5 font-bold', e.source === 'human' ? 'text-violet-500' : 'text-emerald-500')}>·</span>
+          ? <span key={`a${i}`} {...cardProps({ kind: 'applied', e }, label)}
+              className={cn('rounded-sm px-0.5 underline decoration-dotted underline-offset-2 cursor-help', EDIT_STYLE[e.source])}>{e.replacement}</span>
+          : <span key={`a${i}`} {...cardProps({ kind: 'applied', e }, label)}
+              className={cn('px-0.5 font-bold cursor-help', e.source === 'human' ? 'text-violet-500' : 'text-emerald-500')}>·</span>
       )
     } else {
       const e = m.e
       const rejected = e.class === 'rejected'
-      const tip = rejected
-        ? `BLOCKED (${e.class}): ${e.reject_reason ?? ''} — LLM wanted "${e.original}" → "${e.replacement}"`
-        : `LLM ${e.class}: "${e.original}" → "${e.replacement || '∅ (delete)'}"`
+      const label = `${rejected ? 'blocked' : 'suggested'} ${e.class}: "${e.original}" → "${e.replacement || 'delete'}"`
       nodes.push(
         <span key={`p${i}`} className="inline-flex items-baseline gap-0.5">
-          <span title={tip}
+          <span {...cardProps({ kind: 'proposal', e }, label)}
             className={cn('rounded-sm px-0.5 underline decoration-dotted underline-offset-2 cursor-help',
               EDIT_STYLE[e.class], !e.replacement && !rejected && 'line-through')}>
             {e.original || '∅'}
@@ -391,7 +623,7 @@ function TurnBody({ turn, busy, onAccept, onReject }: {
               className="px-0.5 text-[11px] leading-none text-green-700 hover:text-green-900 disabled:opacity-40">✓</button>
           )}
           <button onClick={() => onReject(e.id)} disabled={busy}
-            title={rejected ? 'Dismiss this blocked suggestion' : 'Reject this edit'}
+            title={rejected ? 'Dismiss this blocked suggestion (recoverable)' : 'Dismiss this suggestion (recoverable)'}
             className="px-0.5 text-[11px] leading-none text-red-600 hover:text-red-800 disabled:opacity-40">✗</button>
         </span>
       )
@@ -399,13 +631,19 @@ function TurnBody({ turn, busy, onAccept, onReject }: {
     cursor = m.end
   })
   if (cursor < raw.length) nodes.push(<span key="tail">{raw.slice(cursor)}</span>)
-  return <>{nodes}</>
+  return <>{nodes}{hover && (
+    <EditHoverCard
+      card={hover} busy={busy}
+      onAccept={onAccept} onReject={onReject} onOverride={onOverride}
+      onHold={holdCard} onRelease={releaseCard} onClose={closeCard}
+    />
+  )}</>
 }
 
 // ── One transcript turn ───────────────────────────────────────────────────────
 type Panel = 'name' | 'split' | 'merge' | 'insert' | null
 
-function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, onTurn, onSplit, onMerge, onInsert, onEditText, onAcceptEdit, onRejectEdit, onAcceptAllSafe, onMarkReviewed }: {
+function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, onTurn, onSplit, onMerge, onInsert, onEditText, onAcceptEdit, onRejectEdit, onRestoreEdit, onOverrideEdit, onAcceptAllSafe, onDismissAllPending, onMarkReviewed }: {
   turn: ReviewTurn
   colorCls: string
   roster: RosterMember[]
@@ -418,13 +656,17 @@ function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, 
   onSplit: (p: { word_index: number; assign: SplitPayload['assign'] }) => void
   onMerge: (direction: 'up' | 'down') => void
   onInsert: (position: 'before' | 'after') => void
-  onEditText: (text: string) => Promise<unknown>
+  onEditText: (text: string, base: string) => Promise<unknown>
   onAcceptEdit: (editId: string) => void
   onRejectEdit: (editId: string) => void
+  onRestoreEdit: (editId: string) => void
+  onOverrideEdit: (editId: string) => void
   onAcceptAllSafe: () => void
+  onDismissAllPending: () => void
   onMarkReviewed: () => void
 }) {
   const [panel, setPanel] = useState<Panel>(autoOpen ? 'name' : null)
+  const [showDismissed, setShowDismissed] = useState(false)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
   const [saving, setSaving] = useState(false)
@@ -450,15 +692,21 @@ function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, 
   const save = async () => {
     const value = textareaRef.current?.value ?? draft
     setSaveErr(null); setSaving(true)
-    try { await onEditText(value); setEditing(false) }
+    // The base we opened on goes with the change, so the server composes onto
+    // the right stack (and 409s if someone accepted an edit meanwhile).
+    try { await onEditText(value, currentText); setEditing(false) }
     catch (e) { setSaveErr(e instanceof Error ? e.message : 'Save failed') }
     finally { setSaving(false) }
   }
 
+
   const proposed = (turn.cleanup?.edits ?? []).filter(e => e.status === 'proposed')
   const safeCount = proposed.filter(e => e.class === 'mechanical' || e.class === 'filler' || e.class === 'false_start').length
   const transCount = proposed.filter(e => e.class === 'transcription_error').length
-  const rejectedCount = proposed.filter(e => e.class === 'rejected').length
+  // class 'rejected' = the VALIDATOR blocked it (still pending, never acceptable).
+  // status 'rejected' = a human dismissed it (recoverable). Different axes.
+  const blockedCount = proposed.filter(e => e.class === 'rejected').length
+  const dismissed = (turn.cleanup?.edits ?? []).filter(e => e.status === 'rejected')
 
   return (
     <div className={cn('group border-l-4 pl-3 pr-2 py-2.5', colorCls, turn.pinned && 'ring-1 ring-inset ring-amber-400/70 rounded-r')}>
@@ -529,9 +777,9 @@ function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, 
       ) : (
         <>
           <p className="mt-1 text-sm text-gray-700 leading-relaxed">
-            <TurnBody turn={turn} busy={busy} onAccept={onAcceptEdit} onReject={onRejectEdit} />
+            <TurnBody turn={turn} busy={busy} onAccept={onAcceptEdit} onReject={onRejectEdit} onOverride={onOverrideEdit} />
           </p>
-          {(proposed.length > 0 || !turn.text_reviewed) && (
+          {(proposed.length > 0 || dismissed.length > 0 || !turn.text_reviewed) && (
             <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
               {safeCount > 0 && (
                 <button onClick={onAcceptAllSafe} disabled={busy}
@@ -539,15 +787,46 @@ function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, 
                   Accept {safeCount} safe edit{safeCount > 1 ? 's' : ''}
                 </button>
               )}
+              {proposed.length > 0 && (
+                <button onClick={onDismissAllPending} disabled={busy}
+                  title="Clear this turn's remaining suggestions — recoverable below; accepted edits are untouched"
+                  className="px-1.5 py-0.5 rounded border border-gray-300 bg-white text-slate-600 hover:bg-gray-50 hover:text-red-700 disabled:opacity-50">
+                  Remove all remaining ({proposed.length})
+                </button>
+              )}
               {(safeCount + transCount) > 0 && (
                 <span className="text-gray-500">
                   {safeCount + transCount} proposed{transCount ? ` (${transCount} ASR-fix — needs your call)` : ''}
                 </span>
               )}
-              {rejectedCount > 0 && <span className="text-red-600">{rejectedCount} blocked by validator</span>}
+              {blockedCount > 0 && <span className="text-red-600">{blockedCount} blocked by validator</span>}
+              {dismissed.length > 0 && (
+                <button onClick={() => setShowDismissed(v => !v)}
+                  title="Dismissed suggestions are kept, not deleted — you can put any of them back"
+                  className="text-gray-500 hover:text-gray-700 underline">
+                  {dismissed.length} dismissed · {showDismissed ? 'hide' : 'show'}
+                </button>
+              )}
               {!turn.text_reviewed
                 ? <button onClick={onMarkReviewed} disabled={busy} className="ml-auto text-slate-500 hover:text-slate-700 underline">Mark reviewed</button>
                 : <span className="ml-auto text-green-600">✓ text reviewed</span>}
+            </div>
+          )}
+
+          {/* Dismissed ≠ deleted: every one of these can go back in the queue. */}
+          {showDismissed && dismissed.length > 0 && (
+            <div className="mt-1 rounded-md border border-gray-200 bg-gray-50 divide-y divide-gray-100">
+              {dismissed.map(e => (
+                <div key={e.id} className="flex flex-wrap items-baseline gap-1.5 px-2 py-1 text-[11px]">
+                  <span className={cn('font-mono', e.class === 'rejected' ? 'text-red-500' : 'text-gray-400')}>{e.class}</span>
+                  <span className="text-gray-600 line-through decoration-gray-400">{e.original || '∅'}</span>
+                  <span className="text-gray-400">→</span>
+                  <span className="text-gray-700">{e.replacement || <span className="italic text-gray-400">(delete)</span>}</span>
+                  <button onClick={() => onRestoreEdit(e.id)} disabled={busy}
+                    title="Put this suggestion back in the pending queue"
+                    className="ml-auto text-slate-600 hover:text-slate-900 underline disabled:opacity-50">Restore</button>
+                </div>
+              ))}
             </div>
           )}
         </>
@@ -641,6 +920,8 @@ export default function ReviewWorkbenchPage() {
   const setStatus = useSetStatus(id)
   const acceptCleanup = useAcceptCleanup(id)
   const rejectCleanup = useRejectCleanup(id)
+  const restoreCleanup = useRestoreCleanup(id)
+  const overrideCleanup = useOverrideCleanup(id)
   const editTurnText = useEditTurnText(id)
   const reviewTurnText = useReviewTurnText(id)
 
@@ -666,7 +947,8 @@ export default function ReviewWorkbenchPage() {
   const reviewed = totalSpeakers - pendingSpeakers
   const busy = applySpeaker.isPending || overrideTurn.isPending || splitTurn.isPending
     || mergeTurn.isPending || insertTurn.isPending || acceptAll.isPending || setStatus.isPending
-    || acceptCleanup.isPending || rejectCleanup.isPending || editTurnText.isPending || reviewTurnText.isPending
+    || acceptCleanup.isPending || rejectCleanup.isPending || restoreCleanup.isPending
+    || overrideCleanup.isPending || editTurnText.isPending || reviewTurnText.isPending
   const badge = tierBadge(hearing.status)
   const verifyErr = setStatus.error as (Error & { unresolved?: string[] }) | null
 
@@ -777,14 +1059,35 @@ export default function ReviewWorkbenchPage() {
                 onInsert={(position) => insertTurn.mutate({ turnId: turn.id, position }, {
                   onSuccess: (r) => { flagDemotion(r); setAutoOpenId(r.new_turn_id) },
                 })}
-                onEditText={(text) => editTurnText.mutateAsync({ turnId: turn.id, text }).then(flagDemotion)}
+                onEditText={(text, base) => editTurnText.mutateAsync({ turnId: turn.id, text, base }).then(flagDemotion)}
                 onAcceptEdit={(edit_id) => acceptCleanup.mutate({ turnId: turn.id, edit_id }, {
                   onSuccess: flagDemotion,
                   onError: (e) => setNotice((e as Error).message),
                 })}
-                onRejectEdit={(edit_id) => rejectCleanup.mutate({ turnId: turn.id, edit_id }, { onSuccess: flagDemotion })}
+                onRejectEdit={(edit_id) => rejectCleanup.mutate({ turnId: turn.id, edit_id }, {
+                  onSuccess: flagDemotion,
+                  onError: (e) => setNotice((e as Error).message),
+                })}
+                onRestoreEdit={(edit_id) => restoreCleanup.mutate({ turnId: turn.id, edit_id }, {
+                  onSuccess: flagDemotion,
+                  onError: (e) => setNotice((e as Error).message),
+                })}
+                onOverrideEdit={(edit_id) => overrideCleanup.mutate({ turnId: turn.id, edit_id }, {
+                  onSuccess: (r) => {
+                    flagDemotion(r)
+                    setNotice('Applied as YOUR edit (violet) — recorded as an admin override of the validator block, not as an AI cleanup.')
+                  },
+                  onError: (e) => setNotice((e as Error).message),
+                })}
                 onAcceptAllSafe={() => acceptCleanup.mutate({ turnId: turn.id, all_safe: true }, {
                   onSuccess: flagDemotion,
+                  onError: (e) => setNotice((e as Error).message),
+                })}
+                onDismissAllPending={() => rejectCleanup.mutate({ turnId: turn.id, all_pending: true }, {
+                  onSuccess: (r) => {
+                    flagDemotion(r)
+                    setNotice(`Dismissed ${r.dismissed} suggestion${r.dismissed === 1 ? '' : 's'} on this turn — recoverable via “${r.dismissed} dismissed · show”.`)
+                  },
                   onError: (e) => setNotice((e as Error).message),
                 })}
                 onMarkReviewed={() => reviewTurnText.mutate({ turnId: turn.id })}

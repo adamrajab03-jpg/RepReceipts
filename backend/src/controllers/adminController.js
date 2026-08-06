@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const db = require('../utils/db');
 const { splitAtWord, splitAtChar, mergeTexts, meanConfidence } = require('../utils/turnText');
 const { classifyEdit, applyEdits, isBulkAcceptable, anchorEdit } = require('../utils/cleanupValidate');
-const { diffToEdits } = require('../utils/textDiff');
+const { composeEdits } = require('../utils/textDiff');
 
 const sha256 = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 const spansOverlap = (a, b) => a.raw_start < b.raw_end && b.raw_start < a.raw_end;
@@ -917,7 +917,82 @@ async function acceptCleanup(req, res) {
 
 // ── POST /api/admin/hearings/:id/turns/:turnId/cleanup/reject ────────────────
 //  Reject a proposal; revert its span to raw_text if it had been applied.
+//  Dismissal is RECOVERABLE, never destructive: the proposal object stays in
+//  suggestions.cleanup with status 'rejected' plus a `dismissed` stamp (who /
+//  when), so it drops out of the active queue but can be restored verbatim.
+//  Nothing is ever spliced out of cleanup.edits.
+//
+//  Two modes:
+//    { edit_id }          dismiss one proposal. If that proposal had previously
+//                         been accepted, its applied text_edit is also removed
+//                         (un-apply), which is the point of a single-edit undo.
+//    { all_pending: true } dismiss every still-`proposed` edit on the turn.
+//                         text_edits is passed through UNTOUCHED, so already-
+//                         accepted edits are structurally out of reach.
 async function rejectCleanup(req, res) {
+  const { edit_id, all_pending } = req.body || {};
+  if (!edit_id && all_pending !== true) {
+    return res.status(400).json({ error: 'Provide edit_id or all_pending: true' });
+  }
+
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
+    const turn = await loadTurn(client, transcriptId, req.params.turnId);
+    if (!turn) return res.status(404).json({ error: 'Turn not found in this hearing' });
+
+    const cleanup = turn.suggestions?.cleanup;
+    if (!cleanup || !Array.isArray(cleanup.edits)) return res.status(400).json({ error: 'No cleanup proposals on this turn' });
+
+    const existingEdits = Array.isArray(turn.suggestions?.text_edits) ? turn.suggestions.text_edits : [];
+    const stamp = { at: new Date().toISOString(), by: req.user?.id ?? null };
+    let textEdits = existingEdits;
+    let dismissed = 0;
+
+    if (all_pending === true) {
+      // Pending only — an accepted edit is never in this set, and text_edits is
+      // not rebuilt at all, so bulk dismissal cannot disturb applied text.
+      for (const e of cleanup.edits) {
+        if (e.status !== 'proposed') continue;
+        e.status = 'rejected';
+        e.dismissed = stamp;
+        dismissed++;
+      }
+      if (!dismissed) return res.json({ data: { dismissed: 0, demoted: false } });
+    } else {
+      const e = cleanup.edits.find((x) => x.id === edit_id);
+      if (!e) return res.status(404).json({ error: 'Proposal not found on this turn' });
+      if (e.status === 'rejected') return res.json({ data: { dismissed: 0, demoted: false } }); // already dismissed
+      e.status = 'rejected';
+      e.dismissed = stamp;
+      dismissed = 1;
+      textEdits = existingEdits.filter(
+        (t) => !(t.source === 'llm' && t.raw_start === e.raw_start && t.raw_end === e.raw_end && t.replacement === e.replacement)
+      );
+    }
+
+    await client.query('BEGIN');
+    await persistTurnText(client, turn, { textEdits, cleanup, reviewedBy: req.user?.id });
+    const demoted = await maybeDemote(client, req.params.id);
+    await client.query('COMMIT');
+    res.json({ data: { dismissed, demoted } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+}
+
+// ── POST /api/admin/hearings/:id/turns/:turnId/cleanup/restore ───────────────
+//  Undo a dismissal: put a dismissed proposal back in the pending queue. Only
+//  `rejected` (dismissed) edits are restorable — `accepted` is already applied
+//  and `superseded` was overwritten by a human edit, so resurrecting either
+//  would contradict the current text. The `dismissed` stamp is KEPT alongside a
+//  `restored` stamp, so the round trip stays auditable.
+async function restoreCleanup(req, res) {
   const { edit_id } = req.body || {};
   if (!edit_id) return res.status(400).json({ error: 'edit_id is required' });
 
@@ -932,16 +1007,127 @@ async function rejectCleanup(req, res) {
     if (!cleanup || !Array.isArray(cleanup.edits)) return res.status(400).json({ error: 'No cleanup proposals on this turn' });
     const e = cleanup.edits.find((x) => x.id === edit_id);
     if (!e) return res.status(404).json({ error: 'Proposal not found on this turn' });
-    e.status = 'rejected';
+    if (e.status !== 'rejected') return res.status(409).json({ error: `Only a dismissed suggestion can be restored (this one is ${e.status})` });
 
-    const textEdits = (Array.isArray(turn.suggestions?.text_edits) ? turn.suggestions.text_edits : [])
-      .filter((t) => !(t.source === 'llm' && t.raw_start === e.raw_start && t.raw_end === e.raw_end && t.replacement === e.replacement));
+    e.status = 'proposed';
+    e.restored = { at: new Date().toISOString(), by: req.user?.id ?? null };
+
+    // text_edits is untouched: restoring only re-queues a suggestion, it never
+    // changes the turn's text. Accepting it afterwards re-validates as usual.
+    const textEdits = Array.isArray(turn.suggestions?.text_edits) ? turn.suggestions.text_edits : [];
 
     await client.query('BEGIN');
     await persistTurnText(client, turn, { textEdits, cleanup, reviewedBy: req.user?.id });
     const demoted = await maybeDemote(client, req.params.id);
     await client.query('COMMIT');
-    res.json({ data: { demoted } });
+    res.json({ data: { restored: 1, demoted } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
+  }
+}
+
+// ── POST /api/admin/hearings/:id/turns/:turnId/cleanup/override ─────────────
+//  Apply a validator-BLOCKED suggestion's text as the admin's OWN edit.
+//
+//  The validator blocked it because it changes meaning. A human may still judge
+//  the change correct — but then the human owns it, so this path can only ever
+//  produce a source:'human' edit. There is deliberately NO route from a blocked
+//  suggestion to an llm edit: acceptCleanup refuses class 'rejected', and this
+//  endpoint never writes source:'llm'. The proposal is marked `superseded`, not
+//  `accepted`, because "accepted" would claim the machine's suggestion was taken
+//  on the machine's authority.
+//
+//  The replacement is applied by building the text it produces and running it
+//  through composeEdits — the same composition a manual save uses — so other
+//  accepted cleanup edits on the turn are untouched.
+async function overrideCleanup(req, res) {
+  const { edit_id } = req.body || {};
+  if (!edit_id) return res.status(400).json({ error: 'edit_id is required' });
+
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
+    const turn = await loadTurn(client, transcriptId, req.params.turnId);
+    if (!turn) return res.status(404).json({ error: 'Turn not found in this hearing' });
+
+    const cleanup = turn.suggestions?.cleanup;
+    if (!cleanup || !Array.isArray(cleanup.edits)) return res.status(400).json({ error: 'No cleanup proposals on this turn' });
+    const p = cleanup.edits.find((x) => x.id === edit_id);
+    if (!p) return res.status(404).json({ error: 'Proposal not found on this turn' });
+    if (p.status !== 'proposed') return res.status(409).json({ error: `Proposal already ${p.status}` });
+    if (p.class !== 'rejected') {
+      return res.status(422).json({ error: 'This path is only for validator-blocked suggestions — use accept for a normal proposal' });
+    }
+
+    const anchor = anchorEdit(turn.raw_text, p);
+    if (!anchor) return res.status(409).json({ error: 'This suggestion no longer matches the current text — re-run cleanup' });
+
+    const existing = Array.isArray(turn.suggestions?.text_edits) ? turn.suggestions.text_edits : [];
+    if (existing.some((t) => spansOverlap(t, anchor))) {
+      return res.status(409).json({ error: 'An edit already covers this text — edit the turn manually instead' });
+    }
+
+    // Where the blocked span sits in the CLEANED text (safe: it overlaps no
+    // existing edit, so its offset shifts only by whole edits before it).
+    let base;
+    try { base = existing.length ? applyEdits(turn.raw_text, existing) : turn.raw_text; }
+    catch (err) { return res.status(409).json({ error: `Existing edits do not reconstruct: ${err.message}` }); }
+    let delta = 0;
+    for (const e of [...existing].sort((a, b) => a.raw_start - b.raw_start)) {
+      if (e.raw_end <= anchor.raw_start) delta += e.replacement.length - (e.raw_end - e.raw_start);
+    }
+    const baseStart = anchor.raw_start + delta;
+    const baseEnd = baseStart + (anchor.raw_end - anchor.raw_start);
+    if (base.slice(baseStart, baseEnd) !== p.original) {
+      return res.status(409).json({ error: 'This suggestion no longer matches the current text — re-run cleanup' });
+    }
+
+    const submitted = base.slice(0, baseStart) + p.replacement + base.slice(baseEnd);
+    if (submitted === base) return res.status(422).json({ error: 'That suggestion would not change the text' });
+    if (!submitted.trim().length) return res.status(400).json({ error: 'Use delete-merge to empty a turn' });
+
+    const composed = composeEdits(turn.raw_text, existing, submitted);
+    if (!composed) return res.status(422).json({ error: 'Could not derive a faithful edit set for that override' });
+    let rebuilt = null;
+    try { rebuilt = applyEdits(turn.raw_text, composed.edits); } catch { rebuilt = null; }
+    if (rebuilt !== submitted) return res.status(422).json({ error: 'Could not derive a faithful edit set for that override' });
+
+    // Stamp every edit this override introduced. composeEdits only ever labels
+    // new spans source:'human', so this can never mark something as llm.
+    const preexisting = (e) => existing.some((x) =>
+      x.raw_start === e.raw_start && x.raw_end === e.raw_end && x.replacement === e.replacement && x.source === e.source);
+    const introduced = composed.edits.filter((e) => e.source === 'human' && !preexisting(e));
+    if (!introduced.length) return res.status(422).json({ error: 'Could not attribute this override to an edit' });
+    const stamp = {
+      at: new Date().toISOString(),
+      by: req.user?.id ?? null,
+      blocked_reason: p.reject_reason ?? null,
+      cleanup_edit_id: p.id,
+    };
+    for (const e of introduced) e.override = stamp;
+
+    p.status = 'superseded';
+    p.overridden = { at: stamp.at, by: stamp.by };
+    // Any other pending proposal the new text now covers is superseded too.
+    for (const e of cleanup.edits) {
+      if (e.status === 'proposed' && composed.edits.some((t) => spansOverlap(e, t))) e.status = 'superseded';
+    }
+
+    await client.query('BEGIN');
+    try {
+      await persistTurnText(client, turn, { textEdits: composed.edits, cleanup, reviewedBy: req.user?.id });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `Edits overlap or do not reconstruct: ${err.message}` });
+    }
+    const demoted = await maybeDemote(client, req.params.id);
+    await client.query('COMMIT');
+    res.json({ data: { applied: introduced.length, demoted } });
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error(err);
@@ -958,7 +1144,7 @@ async function rejectCleanup(req, res) {
 //  recomputes clean_text. raw_text is never touched. Human edits are trusted
 //  (they may legitimately change a word) but always transparent and reversible.
 async function editTurnText(req, res) {
-  const { text } = req.body || {};
+  const { text, base } = req.body || {};
   if (typeof text !== 'string') return res.status(400).json({ error: 'text (string) is required' });
 
   const client = await db.connect();
@@ -968,20 +1154,31 @@ async function editTurnText(req, res) {
     const turn = await loadTurn(client, transcriptId, req.params.turnId);
     if (!turn) return res.status(404).json({ error: 'Turn not found in this hearing' });
 
+    const existing = Array.isArray(turn.suggestions?.text_edits) ? turn.suggestions.text_edits : [];
+
     let textEdits;
     if (text === turn.raw_text) {
       textEdits = []; // reverted to the record
     } else {
       if (!text.trim().length) return res.status(400).json({ error: 'Use delete-merge to empty a turn, not a blank edit' });
-      const derived = diffToEdits(turn.raw_text, text);
+
+      // The editor edits the CLEANED text, so the manual change is composed onto
+      // the existing stack rather than re-derived from raw_text — accepted
+      // cleanup edits the human didn't touch keep their llm provenance.
+      const composed = composeEdits(turn.raw_text, existing, text);
+      if (!composed) return res.status(422).json({ error: 'Could not derive a faithful edit set for that text' });
+
+      // Optimistic concurrency: the client tells us which cleaned text it was
+      // editing. If someone accepted or dismissed an edit meanwhile, the diff
+      // would be taken against the wrong baseline — refuse instead of guessing.
+      if (typeof base === 'string' && base !== composed.base) {
+        return res.status(409).json({ error: 'This turn changed while you were editing (an edit was accepted or removed). Reopen the editor to pick up the current text.' });
+      }
+
       let rebuilt = null;
-      try { rebuilt = applyEdits(turn.raw_text, derived); } catch { rebuilt = null; }
+      try { rebuilt = applyEdits(turn.raw_text, composed.edits); } catch { rebuilt = null; }
       if (rebuilt !== text) return res.status(422).json({ error: 'Could not derive a faithful edit set for that text' });
-      const existing = Array.isArray(turn.suggestions?.text_edits) ? turn.suggestions.text_edits : [];
-      textEdits = derived.map((d) => {
-        const prior = existing.find((t) => t.raw_start === d.raw_start && t.raw_end === d.raw_end && t.replacement === d.replacement);
-        return prior ? { ...prior } : { source: 'human', raw_start: d.raw_start, raw_end: d.raw_end, original: d.original, replacement: d.replacement, at: new Date().toISOString() };
-      });
+      textEdits = composed.edits;
     }
 
     // Supersede any cleanup proposal a human edit now overlaps (keeps the tier gate clean).
@@ -1106,5 +1303,5 @@ async function setStatus(req, res) {
 module.exports = {
   listAdminHearings, getReview, applySpeaker, overrideTurn,
   acceptAll, splitTurn, mergeTurn, insertTurn, setStatus,
-  acceptCleanup, rejectCleanup, editTurnText, reviewTurnText,
+  acceptCleanup, rejectCleanup, restoreCleanup, overrideCleanup, editTurnText, reviewTurnText,
 };
