@@ -154,7 +154,28 @@ async function getHearingTranscript(req, res) {
       ORDER BY st.seq
     `, [transcript.id]);
 
-    res.json({ data: { hearing: hearingRows[0], transcript: { ...transcript, turns } } });
+    // Navigable structure, if this hearing has been sectioned. Ranges only —
+    // end_seq is derived from the next section's start, exactly as the admin
+    // side derives it. Empty array when detection has never run, so the reader
+    // view degrades to a plain transcript.
+    const { rows: sections } = await db.query(`
+      SELECT hs.id, hs.type, hs.label, hs.member_id,
+             st.seq AS start_seq,
+             lead(st.seq) OVER (ORDER BY st.seq) AS next_seq,
+             m.full_name AS member_full_name
+        FROM hearing_sections hs
+        JOIN speaker_turns st ON st.id = hs.start_turn_id
+        LEFT JOIN members m ON m.id = hs.member_id
+       WHERE hs.transcript_id = $1
+       ORDER BY st.seq
+    `, [transcript.id]).catch(() => ({ rows: [] }));
+    const lastSeq = turns.length ? turns[turns.length - 1].seq : 0;
+    const withRanges = sections.map((s) => ({
+      ...s,
+      end_seq: s.next_seq != null ? s.next_seq - 1 : lastSeq,
+    }));
+
+    res.json({ data: { hearing: hearingRows[0], transcript: { ...transcript, turns, sections: withRanges } } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });

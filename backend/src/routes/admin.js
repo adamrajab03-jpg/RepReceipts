@@ -15,6 +15,11 @@ const {
   rejectCleanup,
   restoreCleanup,
   overrideCleanup,
+  updateSection,
+  splitSectionAtTurn,
+  moveSectionBoundary,
+  deleteSection,
+  redetectSections,
   editTurnText,
   reviewTurnText,
 } = require('../controllers/adminController');
@@ -40,6 +45,13 @@ router.post('/hearings/:id/turns/:turnId/cleanup/accept', asyncHandler(acceptCle
 router.post('/hearings/:id/turns/:turnId/cleanup/reject', asyncHandler(rejectCleanup));  // dismiss one / all pending (recoverable)
 router.post('/hearings/:id/turns/:turnId/cleanup/restore', asyncHandler(restoreCleanup)); // undo a dismissal
 router.post('/hearings/:id/turns/:turnId/cleanup/override', asyncHandler(overrideCleanup)); // apply a BLOCKED edit as a human edit
+// Sectioning — ranges over turns. None of these touch speaker_turns.
+router.post('/hearings/:id/sections/redetect',            asyncHandler(redetectSections));    // re-run detection, keep admin edits
+router.patch('/hearings/:id/sections/:sectionId',         asyncHandler(updateSection));       // rename / change type
+router.post('/hearings/:id/sections/split-at-turn',       asyncHandler(splitSectionAtTurn));  // new section starting at a turn
+router.patch('/hearings/:id/sections/:sectionId/boundary', asyncHandler(moveSectionBoundary)); // MOVE a boundary (drag)
+router.delete('/hearings/:id/sections/:sectionId',        asyncHandler(deleteSection));       // REMOVE a boundary (folds up)
+
 router.post('/hearings/:id/accept-all',    asyncHandler(acceptAll));       // attribute all pending speakers
 router.post('/hearings/:id/status',        asyncHandler(setStatus));       // tier: attributed | verified
 

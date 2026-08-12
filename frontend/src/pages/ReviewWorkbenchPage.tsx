@@ -8,9 +8,14 @@ import {
   useReview, useApplySpeaker, useOverrideTurn, useAcceptAll, useSetStatus,
   useSplitTurn, useMergeTurn, useInsertTurn,
   useEditTurnText, useReviewTurnText, useAcceptCleanup, useRejectCleanup, useRestoreCleanup, useOverrideCleanup,
+  useUpdateSection, useSplitAtTurn, useMoveSectionBoundary, useDeleteSection, useRedetectSections,
   type SpeakerDecision, type TurnDecision, type SplitPayload,
 } from '../hooks/useAdmin'
-import type { ReviewTurn, RosterMember, CleanupEdit, AppliedEdit } from '../types/api'
+import type { ReviewTurn, RosterMember, CleanupEdit, AppliedEdit, HearingSection, SectionType } from '../types/api'
+import { groupIntoPhases, layoutHeaders, sectionAnchorId } from '../utils/sectionPhases'
+import { useBoundaryDrag } from '../hooks/useBoundaryDrag'
+import SectionNav from '../components/SectionNav'
+import PhaseHeader from '../components/PhaseHeader'
 import { makeSpeakerColors } from '../utils/speakerColors'
 import { tierBadge } from '../utils/hearingTier'
 import { cn } from '../utils/cn'
@@ -640,10 +645,134 @@ function TurnBody({ turn, busy, onAccept, onReject, onOverride }: {
   )}</>
 }
 
+// ── Section headers ───────────────────────────────────────────────────────────
+// A section is a RANGE over turns, stored as a cut point: only its start is
+// held, its end is "the turn before the next section". So every control here is
+// anchor arithmetic — a gap or an overlap cannot be produced. Editing a section
+// never touches turns, text, or attribution; it only moves boundaries.
+const SECTION_STYLE: Record<SectionType, { bar: string; chip: string; name: string }> = {
+  chair_opening: { bar: 'border-slate-400 bg-slate-50', chip: 'bg-slate-200 text-slate-800', name: 'Chair opening' },
+  ranking_opening: { bar: 'border-indigo-400 bg-indigo-50', chip: 'bg-indigo-200 text-indigo-900', name: 'Ranking opening' },
+  witness_statement: { bar: 'border-teal-400 bg-teal-50', chip: 'bg-teal-200 text-teal-900', name: 'Witness statement' },
+  questioning: { bar: 'border-sky-400 bg-sky-50', chip: 'bg-sky-200 text-sky-900', name: 'Questioning' },
+  closing: { bar: 'border-stone-400 bg-stone-50', chip: 'bg-stone-300 text-stone-800', name: 'Closing' },
+  unassigned: { bar: 'border-amber-400 bg-amber-50', chip: 'bg-amber-200 text-amber-900', name: 'Unassigned' },
+}
+const SECTION_TYPE_LIST: SectionType[] = ['chair_opening', 'ranking_opening', 'witness_statement', 'questioning', 'closing', 'unassigned']
+const SOFT_CONFIDENCE = 0.7
+
+function SectionHeader({ section, prev, turns, busy, dragging, onRename, onRetype, onDragStart, onDragMove, onDragEnd }: {
+  section: HearingSection
+  prev: HearingSection | null
+  turns: ReviewTurn[]
+  busy: boolean
+  dragging: boolean
+  onRename: (label: string) => void
+  onRetype: (type: SectionType) => void
+  onDragStart: (e: React.PointerEvent, args: { sectionId: string; currentSeq: number; min: number; max: number }) => void
+  onDragMove: (e: React.PointerEvent) => void
+  onDragEnd: (e: React.PointerEvent) => void
+}) {
+  const [panel, setPanel] = useState<'rename' | 'type' | null>(null)
+  const [draft, setDraft] = useState(section.label ?? '')
+  const st = SECTION_STYLE[section.type] ?? SECTION_STYLE.unassigned
+  const soft = section.source === 'auto' && (section.confidence ?? 1) < SOFT_CONFIDENCE
+  const body = turns.filter(t => t.seq >= section.start_seq && t.seq <= section.end_seq)
+
+  // The legal window for this boundary: after the previous section's first turn
+  // (so it keeps one) and no later than this section's last turn (so this one
+  // keeps one). The handle stops here; the server enforces the same bounds.
+  const canDrag = !!prev
+  const min = prev ? prev.start_seq + 1 : section.start_seq
+  const max = section.end_seq
+
+  const btn = 'px-1.5 py-0.5 rounded text-[11px] border border-gray-300 bg-white text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed'
+
+  return (
+    <div className={cn('mt-5 mb-1 rounded-lg border-l-4 px-3 py-2', st.bar,
+      soft && 'ring-1 ring-amber-300', dragging && 'ring-2 ring-slate-500 shadow-lg')}>
+      <div className="flex flex-wrap items-center gap-2">
+        {/* Drag handle — grab and move the boundary between turns. Stops at the
+            neighbouring boundaries, so a section can never be dragged away. */}
+        <button
+          onPointerDown={(e) => canDrag && !busy && onDragStart(e, { sectionId: section.id, currentSeq: section.start_seq, min, max })}
+          onPointerMove={onDragMove}
+          onPointerUp={onDragEnd}
+          onPointerCancel={onDragEnd}
+          disabled={!canDrag || busy}
+          title={canDrag
+            ? `Drag to move this boundary (turns ${min}–${max})`
+            : 'The first section starts the transcript — it has no boundary to move'}
+          className={cn('px-1 -ml-1 rounded text-slate-400 select-none touch-none',
+            canDrag && !busy ? 'cursor-grab hover:text-slate-700 hover:bg-white active:cursor-grabbing' : 'opacity-25 cursor-not-allowed')}
+        >⣿</button>
+        <span className={cn('px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide', st.chip)}>{st.name}</span>
+
+        {panel === 'rename' ? (
+          <input
+            autoFocus value={draft} onChange={e => setDraft(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { onRename(draft.trim()); setPanel(null) }
+              if (e.key === 'Escape') { setDraft(section.label ?? ''); setPanel(null) }
+            }}
+            onBlur={() => { onRename(draft.trim()); setPanel(null) }}
+            placeholder="Section label…"
+            className="text-sm px-2 py-0.5 rounded border border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-400"
+          />
+        ) : (
+          <button onClick={() => { setDraft(section.label ?? ''); setPanel('rename') }} disabled={busy}
+            title="Rename this section"
+            className="text-sm font-semibold text-slate-800 underline decoration-dotted underline-offset-2 hover:decoration-solid">
+            {section.label || <span className="italic text-gray-400">unlabelled</span>} ✎
+          </button>
+        )}
+
+        <span className="text-xs text-gray-500 tabular-nums">
+          turns {section.start_seq}–{section.end_seq} · {body.length}
+        </span>
+
+        {section.source === 'human' ? (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-violet-100 text-violet-800" title="Edited by an admin — re-detect will not change it">
+            edited ·  kept on re-detect
+          </span>
+        ) : (
+          <span className={cn('text-[10px] tabular-nums', soft ? 'text-amber-700 font-semibold' : 'text-gray-400')}>
+            {section.confidence != null ? `${Math.round(section.confidence * 100)}% ${section.method ?? ''}` : section.method}
+            {soft && ' ⚠'}
+          </span>
+        )}
+
+        <span className="ml-auto flex items-center gap-1">
+          <button onClick={() => setPanel(p => (p === 'type' ? null : 'type'))} disabled={busy} className={btn} title="Change section type">type ▾</button>
+        </span>
+      </div>
+
+      {section.detection_note && (
+        <p className="mt-1 text-[11px] text-amber-800">{section.detection_note}</p>
+      )}
+
+      {panel === 'type' && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {SECTION_TYPE_LIST.map(t => (
+            <button key={t} onClick={() => { onRetype(t); setPanel(null) }} disabled={busy}
+              className={cn('px-2 py-1 rounded text-[11px] border',
+                t === section.type ? 'border-slate-800 bg-slate-800 text-white' : 'border-gray-300 bg-white hover:bg-slate-50')}>
+              {SECTION_STYLE[t].name}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* To start a new section, use the § button on the turn it should begin
+          at — boundaries are set from the transcript, not dragged from here. */}
+    </div>
+  )
+}
+
 // ── One transcript turn ───────────────────────────────────────────────────────
 type Panel = 'name' | 'split' | 'merge' | 'insert' | null
 
-function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, onTurn, onSplit, onMerge, onInsert, onEditText, onAcceptEdit, onRejectEdit, onRestoreEdit, onOverrideEdit, onAcceptAllSafe, onDismissAllPending, onMarkReviewed }: {
+function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, onTurn, onSplit, onMerge, onInsert, onEditText, onAcceptEdit, onRejectEdit, onRestoreEdit, onOverrideEdit, onAcceptAllSafe, onDismissAllPending, onMarkReviewed, onNewSection, startsSection }: {
   turn: ReviewTurn
   colorCls: string
   roster: RosterMember[]
@@ -664,6 +793,10 @@ function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, 
   onAcceptAllSafe: () => void
   onDismissAllPending: () => void
   onMarkReviewed: () => void
+  /** Absent when the hearing has no sections yet. */
+  onNewSection?: () => void
+  /** True when a section already begins at this turn (§ is then a no-op). */
+  startsSection: boolean
 }) {
   const [panel, setPanel] = useState<Panel>(autoOpen ? 'name' : null)
   const [showDismissed, setShowDismissed] = useState(false)
@@ -743,6 +876,13 @@ function TurnRow({ turn, colorCls, roster, buckets, busy, prev, next, autoOpen, 
           <button onClick={() => toggle('insert')} disabled={busy}
             title="Insert a blank turn before/after"
             className="px-1.5 py-0.5 rounded text-slate-500 hover:text-emerald-700 hover:bg-emerald-50">+</button>
+          {onNewSection && (
+            <button onClick={() => onNewSection()} disabled={busy || startsSection}
+              title={startsSection
+                ? 'A section already starts at this turn'
+                : 'Start a new section here — turns above stay in the current section, this turn onward become a new one'}
+              className="px-1.5 py-0.5 rounded text-slate-500 hover:text-indigo-700 hover:bg-indigo-50 disabled:opacity-30 disabled:cursor-not-allowed">§</button>
+          )}
         </span>
       </div>
 
@@ -922,6 +1062,11 @@ export default function ReviewWorkbenchPage() {
   const rejectCleanup = useRejectCleanup(id)
   const restoreCleanup = useRestoreCleanup(id)
   const overrideCleanup = useOverrideCleanup(id)
+  const updateSection = useUpdateSection(id)
+  const splitAtTurn = useSplitAtTurn(id)
+  const moveBoundary = useMoveSectionBoundary(id)
+  const deleteSection = useDeleteSection(id)
+  const redetect = useRedetectSections(id)
   const editTurnText = useEditTurnText(id)
   const reviewTurnText = useReviewTurnText(id)
 
@@ -938,6 +1083,27 @@ export default function ReviewWorkbenchPage() {
       .sort((a, b) => a.ordinal - b.ordinal),
     [speakerInfo])
 
+  // EVERY hook must run on every render, so anything hook-bearing lives ABOVE
+  // the loading/error early returns below. Putting useBoundaryDrag after them
+  // meant the first (loading) render registered fewer hooks than the second,
+  // which is exactly React's "rendered more hooks than during the previous
+  // render" crash. `turns` is [] while loading, so this is safe here.
+  const turnBySeq = useMemo(() => new Map(turns.map(t => [t.seq, t])), [turns])
+  const onSectionErr = useCallback((e: unknown) => setNotice((e as Error).message), [])
+
+  // One hook instance for the whole page: it tracks WHICHEVER boundary is being
+  // dragged, keyed by section id, rather than one hook per section header.
+  const { drag, start: dragStart, move: dragMove, end: dragEnd } = useBoundaryDrag(
+    useCallback((sectionId: string, seq: number) => {
+      const t = turnBySeq.get(seq)
+      if (!t) return
+      moveBoundary.mutate({ sectionId, start_turn_id: t.id }, {
+        onSuccess: (r) => { if (r.moved) setNotice(`Boundary moved from turn ${r.from_seq} to ${r.to_seq}.`) },
+        onError: onSectionErr,
+      })
+    }, [turnBySeq, moveBoundary, onSectionErr]),
+  )
+
   if (isLoading) return <div className="py-16 text-center text-sm text-gray-400">Loading…</div>
   if (error || !data) return <div className="py-16 text-center text-sm text-red-600">Failed to load review data.</div>
 
@@ -949,6 +1115,8 @@ export default function ReviewWorkbenchPage() {
     || mergeTurn.isPending || insertTurn.isPending || acceptAll.isPending || setStatus.isPending
     || acceptCleanup.isPending || rejectCleanup.isPending || restoreCleanup.isPending
     || overrideCleanup.isPending || editTurnText.isPending || reviewTurnText.isPending
+    || updateSection.isPending || splitAtTurn.isPending
+    || moveBoundary.isPending || deleteSection.isPending || redetect.isPending
   const badge = tierBadge(hearing.status)
   const verifyErr = setStatus.error as (Error & { unresolved?: string[] }) | null
 
@@ -959,6 +1127,18 @@ export default function ReviewWorkbenchPage() {
 
   const displayName = (t: ReviewTurn) =>
     t.member_full_name ?? t.speaker_name ?? ordinalLabel(t.speaker_ordinal)
+
+  // Sections are optional: a hearing that has never been through the detection
+  // pass renders exactly as before, with no headers and no re-detect button.
+  const sections: HearingSection[] = data.sections ?? []
+  // Big phase headers are derived by grouping CONSECUTIVE same-phase sections
+  // at render time — same helper the public transcript uses. No data model.
+  const phaseGroups = groupIntoPhases(sections)
+  const headerSlots = layoutHeaders(turns, sections)
+  const phaseIndexOf = new Map(phaseGroups.map((g, i) => [g.anchorId, i]))
+  const sectionErr = (updateSection.error ?? splitAtTurn.error
+    ?? moveBoundary.error ?? deleteSection.error ?? redetect.error) as Error | null
+  const sectionStartTurns = new Set(sections.map(s => s.start_turn_id))
 
   return (
     <div>
@@ -972,6 +1152,20 @@ export default function ReviewWorkbenchPage() {
           <span className="text-sm text-gray-500"><span className="font-medium">{reviewed} / {totalSpeakers}</span> speakers reviewed{pendingSpeakers > 0 && ` · ${pendingSpeakers} pending`}</span>
 
           <div className="ml-auto flex items-center gap-2">
+            {sections.length > 0 && (
+              <button
+                onClick={() => redetect.mutate(undefined, {
+                  onSuccess: (r) => setNotice(
+                    `Re-detected sections — ${r.detected} auto section${r.detected === 1 ? '' : 's'} rebuilt, ` +
+                    `${r.preserved} admin-edited kept${r.skipped ? ` (${r.skipped} detected cut${r.skipped === 1 ? '' : 's'} skipped inside your edits)` : ''}.`),
+                  onError: onSectionErr,
+                })}
+                disabled={busy}
+                title="Re-run heuristic detection. Sections you have edited are kept exactly as they are."
+                className="text-sm font-medium px-3 py-1.5 rounded-lg border border-gray-300 text-slate-700 hover:bg-white disabled:opacity-50">
+                {redetect.isPending ? 'Re-detecting…' : '↻ Re-detect sections'}
+              </button>
+            )}
             <button
               onClick={() => acceptAll.mutate(undefined, { onSuccess: flagDemotion })}
               disabled={busy || pendingSpeakers === 0}
@@ -1013,12 +1207,66 @@ export default function ReviewWorkbenchPage() {
           </div>
         )}
         {verifyErr && <p className="mt-1 text-xs text-red-600">{verifyErr.message}{verifyErr.unresolved?.length ? `: ${verifyErr.unresolved.join(', ')}` : ''}</p>}
+        {sectionErr && <p className="mt-1 text-xs text-red-600">Section edit failed: {sectionErr.message}</p>}
         {setStatus.isSuccess && (
           <p className="mt-1 text-xs text-green-700">
             Now “{setStatus.data.status === 'verified' ? 'Human-verified' : 'Speakers attributed'}”. <Link to={`/hearings/${id}`} className="underline">View public transcript →</Link>
           </p>
         )}
       </div>
+
+      {/* Two-level jump list — phases derived from section types at render time */}
+      {phaseGroups.length > 0 && (
+        <SectionNav
+          groups={phaseGroups}
+          className="mt-4"
+          editing={{
+            busy,
+            firstSectionId: sections[0]?.id,
+            // Rough placement: split at the midpoint, then drag the new
+            // boundary's handle to the exact turn.
+            onAdd: (sectionId) => {
+              const s = sections.find(x => x.id === sectionId)
+              if (!s) return
+              const mid = turnBySeq.get(Math.max(s.start_seq + 1, Math.floor((s.start_seq + s.end_seq) / 2)))
+              if (!mid) return
+              splitAtTurn.mutate({ turn_id: mid.id }, {
+                onSuccess: (r) => {
+                  setNotice(r.noop
+                    ? 'That turn already starts a section — nothing changed.'
+                    : `New section added at turn ${mid.seq}. Drag its ⣿ handle to the exact turn, then name it.`)
+                  if (!r.noop && r.new_section_id) {
+                    setTimeout(() => document.getElementById(sectionAnchorId(r.new_section_id!))
+                      ?.scrollIntoView({ behavior: 'smooth', block: 'center' }), 80)
+                  }
+                },
+                onError: onSectionErr,
+              })
+            },
+            onDelete: (sectionId) => {
+              const s = sections.find(x => x.id === sectionId)
+              const i = sections.findIndex(x => x.id === sectionId)
+              if (!s || i < 1) return
+              const above = sections[i - 1]
+              const n = s.end_seq - s.start_seq + 1
+              // The consequence, stated before it happens — this is the guard
+              // against the silent relabelling that merge used to do.
+              const ok = window.confirm(
+                `Delete the boundary "${s.label || SECTION_STYLE[s.type].name}"?\n\n` +
+                `Its ${n} turn${n === 1 ? '' : 's'} (${s.start_seq}–${s.end_seq}) will join ` +
+                `"${above.label || SECTION_STYLE[above.type].name}" above and take that name.\n\n` +
+                `No turns are lost. You can drop a new boundary back here afterwards.`)
+              if (!ok) return
+              deleteSection.mutate({ sectionId }, {
+                onSuccess: (r) => setNotice(
+                  `Boundary removed — ${r.absorbed_turns} turn${r.absorbed_turns === 1 ? '' : 's'} joined the section above` +
+                  `${r.absorbed_label ? ` (was “${r.absorbed_label}”, recorded on the survivor)` : ''}.`),
+                onError: onSectionErr,
+              })
+            },
+          }}
+        />
+      )}
 
       {/* Chronological transcript */}
       <div className="mt-4 bg-white rounded-xl border border-gray-200 divide-y divide-gray-50">
@@ -1027,8 +1275,40 @@ export default function ReviewWorkbenchPage() {
           const isFirst = info.firstTurnId === turn.id
           const prev = i > 0 ? { name: displayName(turns[i - 1]), key: turns[i - 1].speaker_key } : null
           const next = i < turns.length - 1 ? { name: displayName(turns[i + 1]), key: turns[i + 1].speaker_key } : null
+          const slots = headerSlots.get(turn.id) ?? []
           return (
-            <div key={turn.id}>
+            <div key={turn.id} data-turn-seq={turn.seq}>
+              {/* Where the dragged boundary would land if released now. */}
+              {drag?.seq === turn.seq && (
+                <div className="relative h-0">
+                  <div className="absolute inset-x-0 -top-px h-1 bg-slate-800 rounded-full" />
+                  <div className="absolute left-2 -top-3 px-1.5 py-0.5 rounded bg-slate-800 text-white text-[10px] font-medium">
+                    section starts at turn {turn.seq}
+                  </div>
+                </div>
+              )}
+              {slots.map(({ phase, section }) => {
+                const sIdx = sections.findIndex(s => s.id === section.id)
+                return (
+                <div key={section.id} className="px-3">
+                  {phase && <PhaseHeader group={phase} index={phaseIndexOf.get(phase.anchorId) ?? 0} />}
+                  <div id={sectionAnchorId(section.id)} className="scroll-mt-28">
+                  <SectionHeader
+                    section={section}
+                    prev={sIdx > 0 ? sections[sIdx - 1] : null}
+                    turns={turns}
+                    busy={busy}
+                    dragging={drag?.sectionId === section.id}
+                    onRename={(label) => updateSection.mutate({ sectionId: section.id, label }, { onError: onSectionErr })}
+                    onRetype={(type) => updateSection.mutate({ sectionId: section.id, type }, { onError: onSectionErr })}
+                    onDragStart={dragStart}
+                    onDragMove={dragMove}
+                    onDragEnd={dragEnd}
+                  />
+                  </div>
+                </div>
+                )
+              })}
               {isFirst && (
                 <div className="px-3">
                   <SpeakerHeader
@@ -1091,6 +1371,13 @@ export default function ReviewWorkbenchPage() {
                   onError: (e) => setNotice((e as Error).message),
                 })}
                 onMarkReviewed={() => reviewTurnText.mutate({ turnId: turn.id })}
+                startsSection={sectionStartTurns.has(turn.id)}
+                onNewSection={sections.length ? () => splitAtTurn.mutate({ turn_id: turn.id }, {
+                  onSuccess: (r) => setNotice(r.noop
+                    ? 'That turn already starts a section — nothing changed.'
+                    : `New section starts at turn ${turn.seq}. Give it a name and type in its header above.`),
+                  onError: onSectionErr,
+                }) : undefined}
               />
             </div>
           )

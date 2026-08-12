@@ -121,6 +121,17 @@ export interface SpeakerTurn {
   topics: Topic[]
 }
 
+/** A section as the PUBLIC transcript needs it: a labelled range, nothing more. */
+export interface PublicSection {
+  id: string
+  type: SectionType
+  label: string | null
+  member_id: string | null
+  member_full_name: string | null
+  start_seq: number
+  end_seq: number
+}
+
 export interface Transcript {
   id: string
   hearing_id: string
@@ -129,6 +140,8 @@ export interface Transcript {
   status: string
   created_at: string
   turns: SpeakerTurn[]
+  /** Empty when the hearing has never been sectioned — the view degrades to a plain transcript. */
+  sections?: PublicSection[]
 }
 
 export interface HearingTranscript {
@@ -357,6 +370,33 @@ export interface ReviewTurn {
   text_reviewed: boolean
 }
 
+export type SectionType =
+  | 'chair_opening' | 'ranking_opening' | 'witness_statement'
+  | 'questioning' | 'closing' | 'unassigned'
+
+/**
+ * One navigable section: a RANGE over speaker_turns, stored as a cut point.
+ * `end_seq` is derived (the turn before the next section starts), so sections
+ * are always contiguous and never overlap.
+ */
+export interface HearingSection {
+  id: string
+  order_index: number
+  type: SectionType
+  label: string | null
+  member_id: string | null
+  member_full_name: string | null
+  start_turn_id: string
+  start_seq: number
+  end_seq: number
+  /** 'human' = an admin edited it; re-detection will not touch it. */
+  source: 'auto' | 'human'
+  confidence: number | null
+  method: string | null
+  detection_note: string | null
+  edited_at: string | null
+}
+
 export interface ReviewData {
   hearing: {
     id: string
@@ -369,6 +409,8 @@ export interface ReviewData {
   transcript_id: string
   roster: RosterMember[]
   turns: ReviewTurn[]
+  /** Empty when the hearing has never been through the detection pass. */
+  sections: HearingSection[]
 }
 
 export interface AdminHearing {

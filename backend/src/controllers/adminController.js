@@ -3,6 +3,7 @@ const db = require('../utils/db');
 const { splitAtWord, splitAtChar, mergeTexts, meanConfidence } = require('../utils/turnText');
 const { classifyEdit, applyEdits, isBulkAcceptable, anchorEdit } = require('../utils/cleanupValidate');
 const { composeEdits } = require('../utils/textDiff');
+const { detectSections, loadSectionTurns, writeSections, turnsFingerprint, assertTiling } = require('../utils/sectionDetect');
 
 const sha256 = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 const spansOverlap = (a, b) => a.raw_start < b.raw_end && b.raw_start < a.raw_end;
@@ -279,8 +280,11 @@ async function getReview(req, res) {
     `, [transcriptId]);
 
     const roster = await loadRoster(db);
+    // Sectioning is optional: a hearing that has never been through the
+    // detection pass simply has none, and the workbench renders as before.
+    const sections = await loadSections(db, transcriptId).catch(() => []);
 
-    res.json({ data: { hearing: hRows[0], transcript_id: transcriptId, roster, turns } });
+    res.json({ data: { hearing: hRows[0], transcript_id: transcriptId, roster, turns, sections } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });
@@ -761,6 +765,23 @@ async function mergeTurn(req, res) {
         JSON.stringify(structural),
       ]
     );
+    // A section may be anchored on the turn we are about to delete. Its words
+    // survive inside `target`, so the section survives too — re-point it there
+    // rather than letting ON DELETE RESTRICT block the merge. If that would
+    // collide with the section already anchored on `target`, drop the duplicate
+    // anchor (two sections cannot start at the same turn).
+    await client.query(
+      `DELETE FROM hearing_sections
+        WHERE start_turn_id = $1
+          AND EXISTS (SELECT 1 FROM hearing_sections o
+                       WHERE o.transcript_id = hearing_sections.transcript_id
+                         AND o.start_turn_id = $2)`,
+      [victim.id, target.id]
+    );
+    await client.query(
+      `UPDATE hearing_sections SET start_turn_id = $2, updated_at = now() WHERE start_turn_id = $1`,
+      [victim.id, target.id]
+    );
     await client.query(`DELETE FROM speaker_turns WHERE id = $1`, [victim.id]);
     await client.query(
       `UPDATE speaker_turns SET seq = seq - 1 WHERE transcript_id = $1 AND seq > $2`,
@@ -1028,6 +1049,323 @@ async function restoreCleanup(req, res) {
   } finally {
     client.release();
   }
+}
+
+// ============================================================================
+//  SECTIONS — navigable structure over the transcript.
+// ----------------------------------------------------------------------------
+//  A section is a RANGE, stored as a cut point: only its START turn is kept and
+//  its end is implicitly the turn before the next section's start. Gaps and
+//  overlaps are therefore unrepresentable, and the four editing operations are
+//  anchor arithmetic. NOTHING in here writes speaker_turns — no text, no
+//  attribution, no speaker_key. Ordering always comes from the anchor turn's
+//  CURRENT seq, never from a stored seq, because structural edits renumber seq.
+//
+//  Every edit here stamps source='human', which makes re-detection leave the
+//  section (and its span) alone. A boundary move changes the extent of TWO
+//  sections, so BOTH are stamped — otherwise re-detection would legitimately
+//  re-cut the neighbour and undo the move.
+// ============================================================================
+const SECTION_TYPES = ['chair_opening', 'ranking_opening', 'witness_statement', 'questioning', 'closing', 'unassigned'];
+
+/** Sections with derived start/end seq, ordered by the anchor's live position. */
+async function loadSections(runner, transcriptId) {
+  const { rows } = await runner.query(`
+    SELECT hs.id, hs.order_index, hs.type, hs.label, hs.member_id, hs.start_turn_id,
+           hs.source, hs.confidence, hs.method, hs.detection_note, hs.edited_at,
+           st.seq AS start_seq,
+           lead(st.seq) OVER (ORDER BY st.seq) AS next_seq,
+           m.full_name AS member_full_name
+      FROM hearing_sections hs
+      JOIN speaker_turns st ON st.id = hs.start_turn_id
+      LEFT JOIN members m ON m.id = hs.member_id
+     WHERE hs.transcript_id = $1
+     ORDER BY st.seq`, [transcriptId]);
+  const { rows: last } = await runner.query(
+    `SELECT max(seq) AS max_seq FROM speaker_turns WHERE transcript_id = $1`, [transcriptId]);
+  const maxSeq = last[0]?.max_seq ?? 0;
+  return rows.map((r, i) => ({
+    ...r,
+    order_index: i,
+    end_seq: r.next_seq != null ? r.next_seq - 1 : maxSeq,
+  }));
+}
+
+/** order_index follows the anchors' live seq order. Caller owns the transaction. */
+async function renumberSections(runner, transcriptId) {
+  await runner.query('SET CONSTRAINTS hearing_sections_order_uniq DEFERRED');
+  await runner.query(`
+    WITH ordered AS (
+      SELECT hs.id, (row_number() OVER (ORDER BY st.seq) - 1)::int AS ord
+        FROM hearing_sections hs
+        JOIN speaker_turns st ON st.id = hs.start_turn_id
+       WHERE hs.transcript_id = $1)
+    UPDATE hearing_sections h SET order_index = o.ord, updated_at = now()
+      FROM ordered o WHERE h.id = o.id AND h.order_index IS DISTINCT FROM o.ord`, [transcriptId]);
+}
+
+// Tiling enforcement lives in utils/sectionDetect (assertTiling) so the admin
+// endpoints and the CLI share ONE implementation. It is called inside each
+// transaction immediately before COMMIT: a multi-step operation is free to pass
+// through intermediate states and is validated once, whole. Anything that would
+// leave a gap, an overlap, or a turn belonging to no section throws and rolls
+// the edit back — the same discipline as the no-word-loss turn invariant.
+const assertContiguousTiling = assertTiling;
+
+const stampHuman = (runner, id, userId) => runner.query(
+  `UPDATE hearing_sections
+      SET source = 'human', confidence = NULL, edited_by = $2, edited_at = now(), updated_at = now()
+    WHERE id = $1`, [id, userId ?? null]);
+
+/** Fetch one section (with derived range) and assert it belongs to this hearing. */
+async function sectionInHearing(runner, hearingId, sectionId) {
+  const transcriptId = await primaryTranscriptId(runner, hearingId);
+  if (!transcriptId) return { error: [404, 'No transcript for this hearing'] };
+  const all = await loadSections(runner, transcriptId);
+  const idx = all.findIndex((s) => s.id === sectionId);
+  if (idx < 0) return { error: [404, 'Section not found on this hearing'] };
+  return { transcriptId, all, idx, section: all[idx] };
+}
+
+// ── PATCH /api/admin/hearings/:id/sections/:sectionId ────────────────────────
+//  Rename and/or retype. This is how an opening block gets carved up: set a
+//  section's type to ranking_opening or witness_statement and give it a label.
+async function updateSection(req, res) {
+  const { label, type, member_id } = req.body || {};
+  if (label === undefined && type === undefined && member_id === undefined) {
+    return res.status(400).json({ error: 'Provide label, type, or member_id' });
+  }
+  if (type !== undefined && !SECTION_TYPES.includes(type)) {
+    return res.status(400).json({ error: `type must be one of: ${SECTION_TYPES.join(', ')}` });
+  }
+  const client = await db.connect();
+  try {
+    const found = await sectionInHearing(client, req.params.id, req.params.sectionId);
+    if (found.error) return res.status(found.error[0]).json({ error: found.error[1] });
+
+    await client.query('BEGIN');
+    const sets = [];
+    const vals = [req.params.sectionId];
+    if (label !== undefined) { vals.push(label === '' ? null : label); sets.push(`label = $${vals.length}`); }
+    if (type !== undefined) { vals.push(type); sets.push(`type = $${vals.length}`); }
+    if (member_id !== undefined) { vals.push(member_id || null); sets.push(`member_id = $${vals.length}`); }
+    await client.query(`UPDATE hearing_sections SET ${sets.join(', ')}, updated_at = now() WHERE id = $1`, vals);
+    await stampHuman(client, req.params.sectionId, req.user?.id);
+    await assertContiguousTiling(client, found.transcriptId);
+    await client.query('COMMIT');
+
+    res.json({ data: { sections: await loadSections(client, found.transcriptId) } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.tiling) return res.status(409).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally { client.release(); }
+}
+
+// ── POST /api/admin/hearings/:id/sections/split-at-turn ──────────────────────
+//  "New section starting here." The containing section is resolved SERVER-side
+//  from the turn, so a stale client list can never split the wrong section.
+//  Turns before the split stay put; turns from it onward become a new section
+//  for the admin to label. Splitting AT a section's own first turn is a no-op,
+//  not an error — that turn already begins a section.
+async function splitSectionAtTurn(req, res) {
+  const { turn_id, type, label } = req.body || {};
+  if (!turn_id) return res.status(400).json({ error: 'turn_id is required' });
+  if (type !== undefined && !SECTION_TYPES.includes(type)) {
+    return res.status(400).json({ error: `type must be one of: ${SECTION_TYPES.join(', ')}` });
+  }
+
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No transcript for this hearing' });
+
+    const { rows: t } = await client.query(
+      `SELECT id, seq FROM speaker_turns WHERE id = $1 AND transcript_id = $2`, [turn_id, transcriptId]);
+    if (!t.length) return res.status(404).json({ error: 'That turn is not in this transcript' });
+    const seq = t[0].seq;
+
+    const all = await loadSections(client, transcriptId);
+    if (!all.length) return res.status(409).json({ error: 'This hearing has no sections yet — run detection first' });
+
+    const container = all.find((s) => seq >= s.start_seq && seq <= s.end_seq);
+    if (!container) return res.status(409).json({ error: 'No section covers that turn' });
+    if (container.start_seq === seq) {
+      // Already a boundary. Nothing to do, and nothing to complain about.
+      return res.json({ data: { noop: true, section_id: container.id, sections: all } });
+    }
+
+    await client.query('BEGIN');
+    const { rows: ins } = await client.query(
+      `INSERT INTO hearing_sections
+         (hearing_id, transcript_id, order_index, type, label, start_turn_id, source, edited_by, edited_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'human',$7, now()) RETURNING id`,
+      [req.params.id, transcriptId, 9999, type ?? container.type, label ?? null, turn_id, req.user?.id ?? null]);
+    await stampHuman(client, container.id, req.user?.id); // it was shortened
+    await renumberSections(client, transcriptId);
+    await assertContiguousTiling(client, transcriptId);
+    await client.query('COMMIT');
+
+    res.json({ data: { noop: false, new_section_id: ins[0].id, sections: await loadSections(client, transcriptId) } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.tiling) return res.status(409).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally { client.release(); }
+}
+
+// ── PATCH /api/admin/hearings/:id/sections/:sectionId/boundary ───────────────
+//  MOVE a boundary. A boundary IS a section's start_turn_id, so this is a
+//  single-row UPDATE: the section above re-derives its end ("the turn before the
+//  next section"), which means there is no intermediate state in which a gap
+//  could exist and no second write to get wrong.
+//
+//  This is the operation merge could never express. Merge deletes a section and
+//  lets the neighbour's LABEL annex its turns — which is how "Sean Davis" came
+//  to span 26 turns. Dragging moves the line without changing who owns what.
+//
+//  CLAMP: the new start must land strictly between the neighbouring anchors —
+//  after the previous section's first turn (so IT keeps a turn) and no later
+//  than this section's current last turn (so THIS one keeps a turn). The client
+//  clamps the handle to the same window; this is the authority, and
+//  assertTiling is the backstop behind both.
+async function moveSectionBoundary(req, res) {
+  const { start_turn_id } = req.body || {};
+  if (!start_turn_id) return res.status(400).json({ error: 'start_turn_id is required' });
+
+  const client = await db.connect();
+  try {
+    const found = await sectionInHearing(client, req.params.id, req.params.sectionId);
+    if (found.error) return res.status(found.error[0]).json({ error: found.error[1] });
+    const { transcriptId, all, idx, section } = found;
+    if (idx === 0) {
+      return res.status(409).json({ error: 'The first section starts the transcript — it has no boundary to move' });
+    }
+    const prev = all[idx - 1];
+
+    const { rows: t } = await client.query(
+      `SELECT id, seq FROM speaker_turns WHERE id = $1 AND transcript_id = $2`, [start_turn_id, transcriptId]);
+    if (!t.length) return res.status(404).json({ error: 'That turn is not in this transcript' });
+    const newSeq = t[0].seq;
+
+    const min = prev.start_seq + 1;   // leaves the section ABOVE at least one turn
+    const max = section.end_seq;      // leaves THIS section at least one turn
+    if (newSeq < min || newSeq > max) {
+      return res.status(409).json({
+        error: `Boundary must land between turns ${min} and ${max} — dragging further would leave a section with no turns`,
+        legal_range: [min, max],
+      });
+    }
+    if (newSeq === section.start_seq) {
+      return res.json({ data: { moved: false, sections: all } }); // dropped where it started
+    }
+
+    await client.query('BEGIN');
+    await client.query(`UPDATE hearing_sections SET start_turn_id = $2, updated_at = now() WHERE id = $1`,
+      [req.params.sectionId, start_turn_id]);
+    // A boundary move changes TWO extents, so both sides are human-edited and
+    // re-detect must leave both alone.
+    await stampHuman(client, req.params.sectionId, req.user?.id);
+    await stampHuman(client, prev.id, req.user?.id);
+    await renumberSections(client, transcriptId);
+    await assertContiguousTiling(client, transcriptId);
+    await client.query('COMMIT');
+
+    res.json({ data: { moved: true, from_seq: section.start_seq, to_seq: newSeq, sections: await loadSections(client, transcriptId) } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.tiling) return res.status(409).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally { client.release(); }
+}
+
+// ── DELETE /api/admin/hearings/:id/sections/:sectionId ───────────────────────
+//  REMOVE a boundary. Deleting a cut point extends the section above through it,
+//  so this section's turns fold upward and take that section's name. Always
+//  upward — removing a cut point has exactly one meaning, and the UI states the
+//  consequence before doing it.
+//
+//  The first section is not a boundary (it is the transcript's start) and
+//  therefore cannot be deleted.
+async function deleteSection(req, res) {
+  const client = await db.connect();
+  try {
+    const found = await sectionInHearing(client, req.params.id, req.params.sectionId);
+    if (found.error) return res.status(found.error[0]).json({ error: found.error[1] });
+    const { transcriptId, all, idx, section } = found;
+    if (idx === 0) {
+      return res.status(409).json({ error: 'The first section starts the transcript — it is not a boundary and cannot be deleted' });
+    }
+    const survivor = all[idx - 1];
+
+    // Keep the trace: the absorbed name lives on the survivor, so a fold can
+    // always be explained (and undone by dropping a new boundary back here).
+    const absorbed = section.label
+      ? `absorbed “${section.label}” (${section.type}, turns ${section.start_seq}–${section.end_seq})` : null;
+    const note = [survivor.detection_note, absorbed].filter(Boolean).join(' · ') || null;
+
+    await client.query('BEGIN');
+    await client.query(`DELETE FROM hearing_sections WHERE id = $1`, [section.id]);
+    await client.query(`UPDATE hearing_sections SET detection_note = $2, updated_at = now() WHERE id = $1`, [survivor.id, note]);
+    await stampHuman(client, survivor.id, req.user?.id);
+    await renumberSections(client, transcriptId);
+    await assertContiguousTiling(client, transcriptId);
+    await client.query('COMMIT');
+
+    res.json({ data: {
+      surviving_section_id: survivor.id,
+      absorbed_label: section.label,
+      absorbed_turns: section.end_seq - section.start_seq + 1,
+      sections: await loadSections(client, transcriptId),
+    } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.tiling) return res.status(409).json({ error: err.message });
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally { client.release(); }
+}
+
+// ── POST /api/admin/hearings/:id/sections/redetect ───────────────────────────
+//  Re-run the heuristic. Auto sections re-derive; human-edited sections are kept
+//  verbatim and detection is forbidden from re-cutting inside their spans.
+//  Proves, before and after, that speaker_turns did not move.
+async function redetectSections(req, res) {
+  const client = await db.connect();
+  try {
+    const transcriptId = await primaryTranscriptId(client, req.params.id);
+    if (!transcriptId) return res.status(404).json({ error: 'No transcript for this hearing' });
+
+    const turns = await loadSectionTurns(client, transcriptId);
+    if (!turns.length) return res.status(400).json({ error: 'That transcript has no turns' });
+    const { rows: roster } = await client.query(`SELECT id, full_name, state FROM members`);
+    const { sections: detected } = detectSections(turns, roster);
+
+    const before = await turnsFingerprint(client, transcriptId);
+    await client.query('BEGIN');
+    const result = await writeSections(client, {
+      hearingId: req.params.id, transcriptId, turns, detected, force: false,
+    });
+    await assertContiguousTiling(client, transcriptId);
+    await client.query('COMMIT');
+    const after = await turnsFingerprint(client, transcriptId);
+    if (before !== after) {
+      console.error('SECTION REDETECT ALTERED speaker_turns — investigate', { transcriptId });
+      return res.status(500).json({ error: 'Re-detect aborted: transcript fingerprint changed' });
+    }
+
+    res.json({ data: {
+      detected: result.inserted, preserved: result.preserved, skipped: result.dropped.length,
+      sections: await loadSections(client, transcriptId),
+    } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally { client.release(); }
 }
 
 // ── POST /api/admin/hearings/:id/turns/:turnId/cleanup/override ─────────────
@@ -1304,4 +1642,5 @@ module.exports = {
   listAdminHearings, getReview, applySpeaker, overrideTurn,
   acceptAll, splitTurn, mergeTurn, insertTurn, setStatus,
   acceptCleanup, rejectCleanup, restoreCleanup, overrideCleanup, editTurnText, reviewTurnText,
+  updateSection, splitSectionAtTurn, moveSectionBoundary, deleteSection, redetectSections,
 };

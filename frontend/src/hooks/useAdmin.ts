@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '../utils/apiFetch'
-import type { AdminHearing, ReviewData, ListResponse, DetailResponse } from '../types/api'
+import type { AdminHearing, ReviewData, ListResponse, DetailResponse, HearingSection, SectionType } from '../types/api'
 
 // ── Dashboard list ──────────────────────────────────────────────────────────
 export function useAdminHearings() {
@@ -286,6 +286,102 @@ export function useSetStatus(hearingId: string) {
         throw err
       }
       return body.data as { status: 'attributed' | 'verified' }
+    },
+    onSuccess: invalidate,
+  })
+}
+
+// ============================================================================
+//  SECTIONS — navigable structure over the transcript.
+// ----------------------------------------------------------------------------
+//  A section is a RANGE stored as a cut point (only its start turn), so every
+//  edit is anchor arithmetic and gaps/overlaps cannot be represented. Each of
+//  these marks the section human-edited server-side, which is what stops a
+//  later re-detect from clobbering it. None of them touch turns.
+// ============================================================================
+type SectionsPayload = { sections: HearingSection[] }
+
+/** Rename and/or retype — e.g. carve a ranking_opening out of an opening block. */
+export function useUpdateSection(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ sectionId, ...body }: { sectionId: string; label?: string; type?: SectionType; member_id?: string | null }): Promise<SectionsPayload> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/sections/${sectionId}`, {
+        method: 'PATCH', body: JSON.stringify(body),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Update failed')
+      return data.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+/**
+ * "New section starting at this turn." Splits whichever section contains the
+ * turn — turns before it stay, turns from it onward become a new section. The
+ * containing section is resolved server-side, so a stale client list cannot
+ * split the wrong one. Clicking a turn that already starts a section is a
+ * no-op, not an error.
+ */
+export function useSplitAtTurn(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ turn_id, type, label }: { turn_id: string; type?: SectionType; label?: string }): Promise<SectionsPayload & { noop: boolean; new_section_id?: string }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/sections/split-at-turn`, {
+        method: 'POST', body: JSON.stringify({ turn_id, type, label }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Split failed')
+      return data.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+/**
+ * MOVE a boundary (drag). A boundary is a section's start turn, so this is a
+ * single-row update — the section above re-derives its end, so a gap cannot be
+ * produced. The server clamps to the neighbours and 409s anything out of range.
+ */
+export function useMoveSectionBoundary(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ sectionId, start_turn_id }: { sectionId: string; start_turn_id: string }): Promise<SectionsPayload & { moved: boolean; from_seq?: number; to_seq?: number }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/sections/${sectionId}/boundary`, {
+        method: 'PATCH', body: JSON.stringify({ start_turn_id }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Move failed')
+      return data.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+/** REMOVE a boundary: this section's turns fold into the one above and take its name. */
+export function useDeleteSection(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async ({ sectionId }: { sectionId: string }): Promise<SectionsPayload & { absorbed_label: string | null; absorbed_turns: number }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/sections/${sectionId}`, { method: 'DELETE' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Delete failed')
+      return data.data
+    },
+    onSuccess: invalidate,
+  })
+}
+
+/** Re-run the heuristic. Auto sections re-derive; admin edits are preserved. */
+export function useRedetectSections(hearingId: string) {
+  const invalidate = useInvalidate(hearingId)
+  return useMutation({
+    mutationFn: async (): Promise<SectionsPayload & { detected: number; preserved: number; skipped: number }> => {
+      const res = await apiFetch(`/api/admin/hearings/${hearingId}/sections/redetect`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Re-detect failed')
+      return data.data
     },
     onSuccess: invalidate,
   })
