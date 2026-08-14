@@ -1,64 +1,32 @@
-import { useRef, useState, useEffect } from 'react'
+import { useRef, useState, useEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { Link } from 'react-router-dom'
-import type { SpeakerTurn as Turn, WordTime } from '../types/api'
+import type { SpeakerTurn as Turn } from '../types/api'
 import { useAuthStore } from '../store/authStore'
 import WordToken from './WordToken'
 import CommentThread from './CommentThread'
 import CommentForm from './CommentForm'
 import { cn } from '../utils/cn'
+import { tokenizeText, type Token } from '../utils/tokenizeTurn'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
-interface Token {
-  word:      string
-  charStart: number
-  charEnd:   number
-  wt?:       WordTime
-}
-
 type QuoteState =
   | { phase: 'idle' }
   | { phase: 'popover'; charStart: number; charEnd: number; text: string; anchorRect: DOMRect }
   | { phase: 'form';    charStart: number; charEnd: number; text: string }
 
-// ── Tokeniser — finds each word's EXACT position in the canonical text ────────
-// The resulting charStart/charEnd values are char offsets into
-// (clean_text ?? raw_text), so the DOM paragraph.textContent === that string
-// and char_start/char_end stored in comment_quotes reference the same string
-// that resolveToMs walks when resolving timestamps.
-function tokenize(turn: Turn): Token[] {
-  const text = turn.clean_text ?? turn.raw_text
-
-  if (turn.word_times?.length) {
-    let searchFrom = 0
-    return turn.word_times.map(wt => {
-      const idx = text.indexOf(wt.w, searchFrom)
-      const charStart = idx !== -1 ? idx : searchFrom
-      const charEnd   = charStart + wt.w.length
-      searchFrom = charEnd
-      return { word: wt.w, charStart, charEnd, wt }
-    })
-  }
-
-  // No word_times: locate each non-whitespace run using exec so we get exact
-  // match.index positions in the original text.
-  const tokens: Token[] = []
-  const re = /\S+/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(text)) !== null) {
-    tokens.push({ word: m[0], charStart: m.index, charEnd: m.index + m[0].length })
-  }
-  return tokens
-}
-
 // ── Renderer — interleaves span tokens with literal text gaps ─────────────────
-// Result: paragraph.textContent === text, character for character.
+// Tokens tile the canonical text exactly (see utils/tokenizeTurn), so every
+// character between them — every space — is emitted verbatim from `text` and
+// paragraph.textContent === text, character for character. Tokens carry their
+// own slice of the text rather than a word from word_times, so a turn with
+// accepted edits reads exactly as clean_text does.
 function renderTokens(text: string, tokens: Token[], turnId: string): React.ReactNode[] {
   const nodes: React.ReactNode[] = []
   let pos = 0
   tokens.forEach((t, i) => {
     if (t.charStart > pos) nodes.push(text.substring(pos, t.charStart))
-    nodes.push(<WordToken key={i} word={t.word} turnId={turnId} timing={t.wt} />)
+    nodes.push(<WordToken key={i} word={text.substring(t.charStart, t.charEnd)} turnId={turnId} timing={t.wt} />)
     pos = t.charEnd
   })
   if (pos < text.length) nodes.push(text.substring(pos))
@@ -93,8 +61,13 @@ export default function SpeakerTurn({ turn, index }: { turn: Turn; index: number
   const displayName =
     turn.member_full_name ?? turn.speaker_name ?? turn.speaker_label_raw ?? 'Unknown Speaker'
   const text        = turn.clean_text ?? turn.raw_text
-  const tokens      = tokenize(turn)
-  const hasWordTimes = !!turn.word_times?.length
+  // Aligning word_times to the text costs real work on a long turn — do it once
+  // per turn, not on every hover/selection re-render.
+  const tokens      = useMemo(() => tokenizeText(text, turn.word_times), [text, turn.word_times])
+  // Words that survived this turn's accepted edits keep their timing; a word an
+  // edit removed or replaced beyond recovery has none, so count what is actually
+  // hoverable rather than the raw word_times length.
+  const timedWords  = tokens.reduce((n, t) => (t.wt ? n + 1 : n), 0)
 
   // ── Quote selection ─────────────────────────────────────────────────────────
   function handleMouseUp() {
@@ -198,9 +171,9 @@ export default function SpeakerTurn({ turn, index }: { turn: Turn; index: number
         {renderTokens(text, tokens, turn.id)}
       </p>
 
-      {hasWordTimes && (
+      {timedWords > 0 && (
         <p className="mt-1 text-xs text-amber-600/60">
-          {turn.word_times!.length} word timestamps — hover each word to inspect ms range
+          {timedWords} word timestamps — hover each word to inspect ms range
         </p>
       )}
 

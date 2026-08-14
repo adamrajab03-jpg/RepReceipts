@@ -1,7 +1,7 @@
 const crypto = require('crypto');
 const db = require('../utils/db');
 const { splitAtWord, splitAtChar, mergeTexts, meanConfidence } = require('../utils/turnText');
-const { classifyEdit, applyEdits, isBulkAcceptable, anchorEdit } = require('../utils/cleanupValidate');
+const { classifyEdit, applyEdits, isBulkAcceptable, anchorEdit, normalizeSpanWhitespace, spanLimits } = require('../utils/cleanupValidate');
 const { composeEdits } = require('../utils/textDiff');
 const { detectSections, loadSectionTurns, writeSections, turnsFingerprint, assertTiling } = require('../utils/sectionDetect');
 
@@ -908,9 +908,20 @@ async function acceptCleanup(req, res) {
         return res.status(422).json({ error: `Re-validation blocked this edit: ${c.reason}` });
       }
       if (all_safe === true && !isBulkAcceptable(c.class)) continue;
-      if (!textEdits.some((t) => t.raw_start === anchor.raw_start && t.raw_end === anchor.raw_end)) {
-        textEdits.push({ source: 'llm', raw_start: anchor.raw_start, raw_end: anchor.raw_end, original: e.original, replacement: e.replacement, class: c.class, at: new Date().toISOString() });
+      // Re-derive the span's whitespace geometry before it can reach clean_text.
+      // Where a model put the surrounding spaces — inside the span or outside —
+      // is arbitrary, and taking it verbatim is what merges words ("thebill") or
+      // doubles a space. Growth is bounded by the neighbouring applied edits, so
+      // this can never create an overlap.
+      const span = normalizeSpanWhitespace(turn.raw_text, { ...anchor, replacement: e.replacement }, spanLimits(textEdits, anchor));
+      // cleanup_edit_id ties the applied edit back to its proposal, so an undo
+      // finds it by identity rather than by geometry — normalising the span
+      // above means the two no longer have to match character for character.
+      if (span && !textEdits.some((t) => t.raw_start === span.raw_start && t.raw_end === span.raw_end)) {
+        textEdits.push({ source: 'llm', cleanup_edit_id: e.id, raw_start: span.raw_start, raw_end: span.raw_end, original: span.original, replacement: span.replacement, class: c.class, at: new Date().toISOString() });
       }
+      // A span that normalises away (the model only re-framed whitespace) still
+      // leaves the queue — it was reviewed, it just changes nothing.
       e.status = 'accepted';
       accepted++;
     }
@@ -988,9 +999,16 @@ async function rejectCleanup(req, res) {
       e.status = 'rejected';
       e.dismissed = stamp;
       dismissed = 1;
-      textEdits = existingEdits.filter(
-        (t) => !(t.source === 'llm' && t.raw_start === e.raw_start && t.raw_end === e.raw_end && t.replacement === e.replacement)
-      );
+      // Un-apply by identity when the applied edit carries its proposal's id,
+      // falling back to the span/replacement match for edits applied before that
+      // stamp existed. Identity is the reliable link: accept normalises the
+      // span's whitespace, so an applied edit need not be geometrically equal to
+      // the proposal it came from.
+      textEdits = existingEdits.filter((t) => {
+        if (t.source !== 'llm') return true;
+        if (t.cleanup_edit_id) return t.cleanup_edit_id !== e.id;
+        return !(t.raw_start === e.raw_start && t.raw_end === e.raw_end && t.replacement === e.replacement);
+      });
     }
 
     await client.query('BEGIN');

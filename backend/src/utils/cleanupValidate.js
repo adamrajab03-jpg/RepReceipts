@@ -282,6 +282,93 @@ function applyEdits(rawText, edits) {
 }
 
 /**
+ * Whitespace-safe splice geometry for a MACHINE edit.
+ *
+ * A model names the text it wants gone (`original`) and what replaces it — but
+ * whether the surrounding spaces belong inside that span is an arbitrary
+ * framing choice, and splicing it verbatim lets that choice damage a word
+ * boundary that nobody asked to change:
+ *
+ *    "the um bill" − " um"  →  "thebill"     (the space went with the filler)
+ *    "the um bill" − "um"   →  "the  bill"   (both spaces stayed)
+ *
+ * So the accept path re-derives the geometry here instead of trusting it: the
+ * span is trimmed to the words themselves, the replacement to its own text, and
+ * a pure deletion absorbs exactly ONE of the whitespace runs beside it. The
+ * composed clean_text then carries exactly the separation raw_text had — one
+ * space where there was whitespace, none where there wasn't.
+ *
+ * Growth over whitespace is bounded by `limits` (the nearest already-applied
+ * edit on each side), so normalising can never manufacture an overlap.
+ *
+ * Only machine edits go through this. A human joining two words is an intended
+ * edit and is applied verbatim — the same trusted-but-transparent split the
+ * rest of this module keeps.
+ *
+ * @returns { raw_start, raw_end, original, replacement } — `original` re-sliced
+ *          from rawText so applyEdits' identity check still holds. Returns null
+ *          when nothing is left to apply (the edit normalises to a no-op).
+ */
+function normalizeSpanWhitespace(rawText, edit, limits = {}) {
+  const minStart = Math.max(0, limits.minStart ?? 0);
+  const maxEnd = Math.min(rawText.length, limits.maxEnd ?? rawText.length);
+  const ws = (i) => /\s/.test(rawText[i]);
+
+  let s = edit.raw_start;
+  let e = edit.raw_end;
+  let replacement = String(edit.replacement ?? '');
+
+  // A whitespace-only span IS a whitespace edit ("  " → " "); its framing is the
+  // whole point, so leave it exactly as proposed.
+  if (!rawText.slice(s, e).trim()) {
+    return { raw_start: s, raw_end: e, original: rawText.slice(s, e), replacement };
+  }
+
+  // Trim the framing off both sides: the span shrinks to the words it removes,
+  // the replacement to the words it contributes. With both trimmed, a
+  // replacement can no longer swallow or duplicate a neighbouring space — the
+  // whitespace on each side of the span is left untouched, right where
+  // raw_text put it.
+  while (s < e && ws(s)) s++;
+  while (e > s && ws(e - 1)) e--;
+  replacement = replacement.replace(/^\s+/, '').replace(/\s+$/, '');
+
+  // A deletion leaves the whitespace from BOTH sides behind. Absorb one run so
+  // the words that close up are separated by a single space — or by nothing,
+  // when the deletion is at an edge and there is no word left on that side.
+  if (replacement === '') {
+    const spaceLeft = s > minStart && ws(s - 1);
+    const spaceRight = e < maxEnd && ws(e);
+    const wordLeft = rawText.slice(minStart, s).trim() !== '';
+    const wordRight = rawText.slice(e, maxEnd).trim() !== '';
+    if (spaceRight && (spaceLeft || !wordLeft)) {
+      while (e < maxEnd && ws(e)) e++;
+    } else if (spaceLeft && !wordRight) {
+      while (s > minStart && ws(s - 1)) s--;
+    }
+  }
+
+  const original = rawText.slice(s, e);
+  if (original === replacement) return null;
+  return { raw_start: s, raw_end: e, original, replacement };
+}
+
+/**
+ * The whitespace `normalizeSpanWhitespace` may absorb around `span`: up to the
+ * nearest already-applied edit on each side, so two adjacent edits can never
+ * grow into each other.
+ */
+function spanLimits(appliedEdits, span) {
+  let minStart = 0;
+  let maxEnd = Infinity;
+  for (const t of appliedEdits) {
+    if (t.raw_end <= span.raw_start) minStart = Math.max(minStart, t.raw_end);
+    if (t.raw_start >= span.raw_end) maxEnd = Math.min(maxEnd, t.raw_start);
+  }
+  return { minStart, maxEnd: maxEnd === Infinity ? undefined : maxEnd };
+}
+
+/**
  * Re-anchor an edit against the CURRENT text by its stored `original` substring.
  * The numeric offset is only a hint: prefer it when it still matches exactly
  * (fast, unambiguous), otherwise locate `original` and accept ONLY a unique
@@ -318,6 +405,8 @@ module.exports = {
   locateEdits,
   applyEdits,
   anchorEdit,
+  normalizeSpanWhitespace,
+  spanLimits,
   // exported for tests / reuse
   soundex,
   phoneticSimilar,

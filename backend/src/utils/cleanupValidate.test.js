@@ -125,6 +125,65 @@ cls('noop', 'unchanged text', 'unchanged text', 'noop');
   ok('anchor+apply: two edits compose to the right result', clean === 'the Senate will come to order')
 }
 
+// ── normalizeSpanWhitespace: the splice never damages a word boundary ────────
+// Whichever way a model frames the span around a word, accepting it must leave
+// the separation raw_text had: one space between the words that close up, none
+// where the deletion sits at an edge, and never a doubled space.
+{
+  // Apply a proposal the way acceptCleanup does, and report the composed text.
+  const compose = (raw, original, replacement, limits) => {
+    const at = raw.indexOf(original);
+    const span = V.normalizeSpanWhitespace(raw, { raw_start: at, raw_end: at + original.length, replacement }, limits);
+    return span ? V.applyEdits(raw, [span]) : raw;
+  };
+  const spaced = (name, raw, original, replacement, expect) =>
+    ok(`${name}: ${JSON.stringify(original)}→${JSON.stringify(replacement)} ⇒ ${JSON.stringify(expect)}`,
+       compose(raw, original, replacement) === expect);
+
+  // Filler removal — every framing of "um" collapses to exactly one space.
+  spaced('filler', 'the um bill', ' um', '', 'the bill');
+  spaced('filler', 'the um bill', 'um ', '', 'the bill');
+  spaced('filler', 'the um bill', ' um ', '', 'the bill');
+  spaced('filler', 'the um bill', 'um', '', 'the bill');          // would have doubled
+  spaced('filler', 'the um bill', 'um', ' ', 'the bill');         // whitespace-only replacement
+  spaced('filler', 'um the bill', 'um ', '', 'the bill');         // at the start: no leading space
+  spaced('filler', 'the bill um', ' um', '', 'the bill');         // at the end: no trailing space
+  spaced('filler', 'the um  bill', ' um ', '', 'the bill');       // pre-existing double space closes to one
+
+  // Replacements keep their neighbours' boundaries whatever the framing.
+  spaced('replacement', 'the um bill', ' um bill', ' law', 'the law');
+  spaced('replacement', 'the um bill', 'the um', 'the', 'the bill');
+  spaced('replacement', 'we we need to act', 'we we', 'we', 'we need to act');
+  spaced('replacement', 'their are three', 'their', 'there', 'there are three');
+
+  // A genuine whitespace edit is left exactly as proposed — its framing IS the edit.
+  spaced('whitespace edit', 'the  bill', '  ', ' ', 'the bill');
+  ok('normalize: a span that reduces to no change returns null',
+     V.normalizeSpanWhitespace('the um bill', { raw_start: 3, raw_end: 7, replacement: ' um ' }) === null);
+
+  // Growth is bounded by the neighbouring applied edits, so it cannot overlap.
+  {
+    const raw = 'the um bill passed';                             // an edit already owns " bill"
+    const applied = [{ raw_start: 7, raw_end: 11, original: 'bill', replacement: 'law' }];
+    const at = raw.indexOf('um');
+    const span = V.normalizeSpanWhitespace(raw, { raw_start: at, raw_end: at + 2, replacement: '' },
+                                           V.spanLimits(applied, { raw_start: at, raw_end: at + 2 }));
+    ok('normalize: growth stops at the neighbouring edit', span.raw_end <= 7);
+    ok('normalize: bounded growth still composes correctly',
+       V.applyEdits(raw, [span, ...applied].sort((a, b) => a.raw_start - b.raw_start)) === 'the law passed');
+  }
+
+  // The composed text never joins two words that raw_text kept apart.
+  const merged = (raw, original, replacement) => {
+    const out = compose(raw, original, replacement);
+    return /\S{2,}/.test(out) && out.split(/\s+/).some((w) => w === 'thebill') ? 'merged' : 'clean';
+  };
+  ok('normalize: no framing of a filler removal can merge words',
+     [' um', 'um ', ' um ', 'um'].every((o) => merged('the um bill', o, '') === 'clean'));
+  ok('normalize: no composed result contains a double space',
+     [' um', 'um ', ' um ', 'um'].every((o) => !/ {2}/.test(compose('the um bill', o, ''))));
+}
+
 // ── Report ───────────────────────────────────────────────────────────────────
 const pad = (s, n) => { s = String(s); return s.length >= n ? s.slice(0, n) : s + ' '.repeat(n - s.length); };
 let lastSection = '';

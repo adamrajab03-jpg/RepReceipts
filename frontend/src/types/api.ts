@@ -313,6 +313,13 @@ export interface AppliedEdit {
   original: string
   replacement: string
   class?: CleanupEdit['class']
+  /**
+   * The proposal this edit was accepted from (source:'llm' only). Accept
+   * normalises the span's whitespace, so the applied edit is not necessarily
+   * geometrically identical to its proposal — this is the link an undo follows.
+   * Absent on edits accepted before the stamp existed.
+   */
+  cleanup_edit_id?: string
   at: string
   by?: string | null
   /**

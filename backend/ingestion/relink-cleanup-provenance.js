@@ -51,8 +51,11 @@ const overlaps = (a, b) => a.raw_start < b.raw_end && b.raw_start < a.raw_end;
 
     for (const p of cleanup.edits) {
       if (p.status !== 'accepted') continue;
-      // Already intact?
-      if (edits.some((e) => e.source === 'llm' && e.raw_start === p.raw_start && e.raw_end === p.raw_end)) continue;
+      // Already intact? By proposal id when the accept stamped one (its span may
+      // have been whitespace-normalised), else by the span it was accepted at.
+      if (edits.some((e) => e.source === 'llm' && (
+        e.cleanup_edit_id ? e.cleanup_edit_id === p.id
+                          : e.raw_start === p.raw_start && e.raw_end === p.raw_end))) continue;
 
       const where = `seq ${t.seq} ${JSON.stringify(p.original)} → ${JSON.stringify(p.replacement)}`;
 
