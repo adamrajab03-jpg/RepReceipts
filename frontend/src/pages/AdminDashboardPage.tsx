@@ -49,6 +49,13 @@ export default function AdminDashboardPage() {
               </div>
             </div>
             <Link
+              to={`/admin/hearings/${h.id}/witnesses`}
+              title="Enter witness titles, organizations and industries"
+              className="shrink-0 text-sm font-medium px-3 py-1.5 rounded-lg border border-gray-300 text-slate-700 hover:bg-gray-50 transition-colors"
+            >
+              Witnesses
+            </Link>
+            <Link
               to={`/admin/hearings/${h.id}/review`}
               className="shrink-0 text-sm font-medium px-3 py-1.5 rounded-lg bg-slate-800 text-white hover:bg-slate-700 transition-colors"
             >

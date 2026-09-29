@@ -8,6 +8,8 @@ import CommentThread from './CommentThread'
 import CommentForm from './CommentForm'
 import { cn } from '../utils/cn'
 import { tokenizeText, type Token } from '../utils/tokenizeTurn'
+import { formatTimecode } from '../utils/timecode'
+import { memberLabel, partyPillClass, partyStateLabel } from '../utils/memberDisplay'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type QuoteState =
@@ -33,26 +35,31 @@ function renderTokens(text: string, tokens: Token[], turnId: string): React.Reac
   return nodes
 }
 
-// ── Role badges ───────────────────────────────────────────────────────────────
-const ROLE_STYLES: Record<string, string> = {
-  chair:   'bg-slate-200 text-slate-700',
-  member:  'bg-blue-100 text-blue-700',
-  witness: 'bg-purple-100 text-purple-700',
-  staff:   'bg-gray-100 text-gray-600',
-  unknown: 'bg-gray-100 text-gray-500',
+// ── Speaker label ─────────────────────────────────────────────────────────────
+// The label is the reader's scanning anchor, so it stays sans-serif and clearly
+// weighted against the serif testimony below it. Role reads as a quiet caption
+// rather than a badge — a wall of coloured pills is noise in a public record.
+const ROLE_LABEL: Record<string, string> = {
+  chair: 'Chair',
+  member: 'Member',
+  witness: 'Witness',
+  staff: 'Staff',
+  unknown: '',
 }
 
-function fmtMs(ms: number) {
-  const s = Math.floor(ms / 1000)
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
-}
+// Naming and party tint live in utils/memberDisplay, shared with the hearing
+// context header — the same person must read identically in both places.
 
 // ── Component ─────────────────────────────────────────────────────────────────
-export default function SpeakerTurn({ turn, index }: { turn: Turn; index: number }) {
+export default function SpeakerTurn({ turn, index, startsSection = false }: {
+  turn: Turn
+  index: number
+  /** A section header sits directly above — it already provides the separation. */
+  startsSection?: boolean
+}) {
   const user         = useAuthStore(s => s.user)
   const paragraphRef = useRef<HTMLParagraphElement>(null)
   const [quoteState, setQuoteState] = useState<QuoteState>({ phase: 'idle' })
-  const [showComments, setShowComments] = useState(false)
 
   // Fall back through: attributed member → witness/non-member name → Deepgram's
   // raw diarization label ("Speaker 2") → last-resort. Without speaker_label_raw
@@ -60,6 +67,12 @@ export default function SpeakerTurn({ turn, index }: { turn: Turn; index: number
   // diarization entirely.
   const displayName =
     turn.member_full_name ?? turn.speaker_name ?? turn.speaker_label_raw ?? 'Unknown Speaker'
+  // Only an attributed member earns "Sen."/"Rep." — a witness or a bare
+  // diarization label is shown exactly as it is.
+  const label       = turn.member_id ? memberLabel(displayName, turn.chamber) : displayName
+  const partyPill   = partyPillClass(turn.party)
+  const partyState  = partyStateLabel(turn.party, turn.state)
+  const roleLabel   = turn.speaker_role ? ROLE_LABEL[turn.speaker_role] ?? '' : ''
   const text        = turn.clean_text ?? turn.raw_text
   // Aligning word_times to the text costs real work on a long turn — do it once
   // per turn, not on every hover/selection re-render.
@@ -119,42 +132,50 @@ export default function SpeakerTurn({ turn, index }: { turn: Turn; index: number
   return (
     <div
       id={`turn-${turn.seq}`}
-      className={cn('py-5 px-5', index % 2 === 0 ? 'bg-white' : 'bg-gray-50/60')}
+      className={cn(
+        'py-6',
+        // Turns are separated by space and a hairline, not by a fill: alternating
+        // stripes read as a spreadsheet, and this is meant to read as a record.
+        !startsSection && index > 0 && 'border-t border-gray-100',
+      )}
     >
-      {/* Speaker header */}
-      <div className="flex items-center gap-2 mb-2">
+      {/* Speaker label — sans, the scanning anchor above the serif testimony */}
+      <div className="mb-2.5 flex flex-wrap items-baseline gap-x-2 gap-y-1">
         {turn.member_id ? (
           <Link
             to={`/members/${turn.member_id}`}
-            className="text-sm font-semibold text-slate-800 hover:text-slate-600 hover:underline"
+            className="text-sm font-semibold tracking-tight text-slate-900 underline decoration-slate-300 decoration-1 underline-offset-[3px] transition-colors hover:decoration-slate-900"
           >
-            {displayName}
+            {label}
           </Link>
         ) : (
-          <span className="text-sm font-semibold text-slate-800">{displayName}</span>
+          <span className="text-sm font-medium text-slate-600">{label}</span>
         )}
 
-        {turn.speaker_role && (
-          <span className={cn('text-xs px-2 py-0.5 rounded-full capitalize',
-            ROLE_STYLES[turn.speaker_role] ?? ROLE_STYLES.unknown)}>
-            {turn.speaker_role}
+        {partyPill && partyState && (
+          <span className={cn('rounded px-1 text-[10px] font-bold leading-4 ring-1 ring-inset', partyPill)}>
+            {partyState}
           </span>
         )}
 
+        {roleLabel && (
+          <span className="text-[11px] uppercase tracking-[0.08em] text-slate-500">{roleLabel}</span>
+        )}
+
         {turn.start_ms != null && (
-          <span className="ml-auto text-xs text-gray-400 font-mono tabular-nums">
-            {fmtMs(turn.start_ms)}
+          <span className="ml-auto text-xs tabular-nums text-slate-500">
+            {formatTimecode(turn.start_ms)}
           </span>
         )}
       </div>
 
       {turn.topics?.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 mb-2">
+        <div className="mb-2 flex flex-wrap gap-1.5">
           {turn.topics.map(t => (
             <Link
               key={t.id}
               to={`/hearings?topic=${t.slug}`}
-              className="text-xs px-2 py-0.5 rounded-full bg-teal-50 text-teal-700 border border-teal-200 hover:bg-teal-100 transition-colors"
+              className="rounded-full border border-teal-100 bg-teal-50/70 px-2 py-0.5 text-[11px] text-teal-700 transition-colors hover:bg-teal-100"
             >
               {t.name}
             </Link>
@@ -162,17 +183,18 @@ export default function SpeakerTurn({ turn, index }: { turn: Turn; index: number
         </div>
       )}
 
-      {/* Word-token paragraph — textContent === clean_text ?? raw_text */}
+      {/* Word-token paragraph — textContent === clean_text ?? raw_text.
+          Serif, ~1.75 leading, measure capped near 70ch: the reading layer. */}
       <p
         ref={paragraphRef}
         onMouseUp={handleMouseUp}
-        className="text-sm text-gray-700 leading-relaxed select-text cursor-text"
+        className="max-w-[70ch] cursor-text select-text font-serif text-[17px] leading-[1.75] text-slate-800"
       >
         {renderTokens(text, tokens, turn.id)}
       </p>
 
       {timedWords > 0 && (
-        <p className="mt-1 text-xs text-amber-600/60">
+        <p className="mt-1.5 text-[11px] text-slate-400">
           {timedWords} word timestamps — hover each word to inspect ms range
         </p>
       )}

@@ -1,3 +1,5 @@
+import type { IndustrySlug } from '../utils/witnessIndustries'
+
 export interface CommitteeMembership {
   committee_id: string
   committee_name: string
@@ -144,9 +146,106 @@ export interface Transcript {
   sections?: PublicSection[]
 }
 
+// ── Reader context (the public hearing header) ───────────────────────────────
+// All three lists are derived server-side from the attributed turns — see
+// getHearingTranscript. Nothing here is a stored hearing-level record.
+
+/** A roster member who actually SPOKE in this hearing. */
+export interface HearingParticipant {
+  id: string
+  full_name: string
+  party: string | null
+  state: string | null
+  chamber: 'house' | 'senate' | null
+  turn_count: number
+  first_seq: number
+  /** Role on the hearing's committee; null when they aren't on its roster. */
+  committee_role: 'chair' | 'ranking_member' | 'member' | null
+  /** At least one of their turns was marked speaker_role 'chair'. */
+  chaired: boolean
+}
+
+/**
+ * A named non-member speaker, as the PUBLIC page needs them. Merged server-side
+ * from two sources (see getHearingTranscript): the speakers the transcript
+ * yields, and the admin-entered hearing_witnesses records.
+ *
+ * `has_record` is the one field to branch on. False = detected in the transcript
+ * but nobody has filled in a record, so only `name` and the turn counts are real.
+ */
+export interface HearingWitness {
+  /** display_name when a record exists, else the raw transcript speaker_name. */
+  name: string
+  title: string | null
+  organization: string | null
+  industry: IndustrySlug | null
+  /** Free-text category; only ever set alongside industry 'other'. */
+  industry_custom: string | null
+  /** The heading this witness groups under — resolved server-side. */
+  industry_label: string | null
+  /** 0 for a witness who submitted testimony but never spoke. */
+  turn_count: number
+  /** Seq of their first turn, for the #turn-N jump link. Null when they never spoke. */
+  first_seq: number | null
+  has_record: boolean
+}
+
+// ── Admin witness editor ────────────────────────────────────────────────────
+
+export interface WitnessIndustry {
+  slug: IndustrySlug
+  label: string
+}
+
+/**
+ * One row in the admin editor. `id: null` means a DRAFT — an identity the
+ * transcript yielded that has never been saved, pre-filled so the admin does not
+ * retype the name.
+ */
+export interface WitnessRow {
+  id: string | null
+  /** THE LINK to this witness's turns: their exact speaker_turns.speaker_name. */
+  speaker_name: string | null
+  display_name: string
+  title: string | null
+  organization: string | null
+  /** Null only on a draft row — a deliberate pick is required to save. */
+  industry: IndustrySlug | null
+  industry_custom: string | null
+  display_order: number
+  // ── derived, read-only ──
+  turn_count: number
+  first_seq: number | null
+  /** Diarization buckets carrying this speaker_name; a rename touches each. */
+  speaker_keys: string[]
+  /**
+   * linked   — the transcript currently has turns under this speaker_name
+   * unlinked — no speaker_name at all (written testimony, or never captured)
+   * orphaned — has a speaker_name that matches nothing, i.e. attribution was
+   *            renamed after this witness was saved
+   */
+  link_state: 'linked' | 'unlinked' | 'orphaned'
+}
+
+export interface WitnessEditorData {
+  hearing: { id: string; title: string; status: Hearing['status'] }
+  industries: WitnessIndustry[]
+  rows: WitnessRow[]
+  saved_count: number
+  detected_count: number
+}
+
+export interface HearingContext {
+  participants: HearingParticipant[]
+  witnesses: HearingWitness[]
+  /** Distinct turn tags across the hearing, most-discussed first. */
+  topics: (Topic & { turn_count: number })[]
+}
+
 export interface HearingTranscript {
   hearing: Hearing & { updated_at: string }
   transcript: Transcript | null
+  context: HearingContext
 }
 
 // ── Comments ──────────────────────────────────────────────────────────────────

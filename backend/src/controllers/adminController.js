@@ -1661,4 +1661,7 @@ module.exports = {
   acceptAll, splitTurn, mergeTurn, insertTurn, setStatus,
   acceptCleanup, rejectCleanup, restoreCleanup, overrideCleanup, editTurnText, reviewTurnText,
   updateSection, splitSectionAtTurn, moveSectionBoundary, deleteSection, redetectSections,
+  // Exported for witnessesController: WHICH transcript the admin side edits
+  // is one decision, and both controllers must make it the same way.
+  primaryTranscriptId,
 };

@@ -23,6 +23,7 @@ const {
   editTurnText,
   reviewTurnText,
 } = require('../controllers/adminController');
+const { getWitnesses, saveWitnesses } = require('../controllers/witnessesController');
 
 const router = Router();
 
@@ -51,6 +52,12 @@ router.patch('/hearings/:id/sections/:sectionId',         asyncHandler(updateSec
 router.post('/hearings/:id/sections/split-at-turn',       asyncHandler(splitSectionAtTurn));  // new section starting at a turn
 router.patch('/hearings/:id/sections/:sectionId/boundary', asyncHandler(moveSectionBoundary)); // MOVE a boundary (drag)
 router.delete('/hearings/:id/sections/:sectionId',        asyncHandler(deleteSection));       // REMOVE a boundary (folds up)
+
+// Witnesses — a record per non-member speaker. Like sections, this layer never
+// writes speaker_turns; a name change in the transcript goes through the
+// /speakers endpoint above so there stays one writer.
+router.get('/hearings/:id/witnesses',  asyncHandler(getWitnesses));  // saved rows + names detected in the transcript
+router.put('/hearings/:id/witnesses',  asyncHandler(saveWitnesses)); // atomic full-set save (add/edit/remove/reorder)
 
 router.post('/hearings/:id/accept-all',    asyncHandler(acceptAll));       // attribute all pending speakers
 router.post('/hearings/:id/status',        asyncHandler(setStatus));       // tier: attributed | verified

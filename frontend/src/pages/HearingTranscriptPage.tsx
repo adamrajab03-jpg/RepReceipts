@@ -1,16 +1,13 @@
 import { Link, useParams } from 'react-router-dom'
 import { useHearingTranscript } from '../hooks/useHearingTranscript'
 import TranscriptView from '../components/TranscriptView'
+import HearingContextHeader from '../components/HearingContextHeader'
+import HearingWitnesses from '../components/HearingWitnesses'
+import { shouldGroupWitnesses } from '../utils/witnessGroups'
 import CommentThread from '../components/CommentThread'
-import { tierBadge, tierBanner } from '../utils/hearingTier'
+import { tierBanner } from '../utils/hearingTier'
+import { youtubeWatchAt } from '../utils/youtube'
 import { cn } from '../utils/cn'
-
-function fmtDate(iso: string | null) {
-  if (!iso) return null
-  return new Date(iso).toLocaleDateString('en-US', {
-    month: 'long', day: 'numeric', year: 'numeric',
-  })
-}
 
 export default function HearingTranscriptPage() {
   const { id } = useParams<{ id: string }>()
@@ -19,9 +16,14 @@ export default function HearingTranscriptPage() {
   if (isLoading) return <p className="text-sm text-gray-500">Loading…</p>
   if (isError || !data) return <p className="text-sm text-red-500">Hearing not found.</p>
 
-  const { hearing, transcript } = data.data
-  const badge = tierBadge(hearing.status)
+  const { hearing, transcript, context } = data.data
   const banner = tierBanner(hearing.status)
+  // One decision, two components: when witness records exist the grouped
+  // section owns them, and the header drops its compact row so the same three
+  // people are not listed twice.
+  const grouped = shouldGroupWitnesses(context.witnesses)
+  // Null unless the hearing has a usable YouTube URL (/live/, /watch?v=, youtu.be).
+  const watchFromStart = youtubeWatchAt(hearing.video_url, 0)
 
   return (
     <div>
@@ -29,20 +31,14 @@ export default function HearingTranscriptPage() {
         ← Back to Hearings
       </Link>
 
-      {/* Hearing header */}
-      <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">
-        <div className="flex items-start justify-between gap-4">
-          <h1 className="text-xl font-bold text-gray-900 leading-snug">{hearing.title}</h1>
-          <span className={cn('text-xs font-medium px-2 py-1 rounded-full shrink-0', badge.cls)}>
-            {badge.label}
-          </span>
-        </div>
-        <div className="flex flex-wrap gap-x-4 gap-y-1 mt-3 text-sm text-gray-500">
-          {hearing.committee_name && <span>{hearing.committee_name}</span>}
-          {hearing.held_on        && <span>{fmtDate(hearing.held_on)}</span>}
-          {hearing.congress       && <span>{hearing.congress}th Congress</span>}
-        </div>
-      </div>
+      {/* Hearing identity + reading context (committee, members, topics, and
+          witnesses too when no records have been entered yet) */}
+      <HearingContextHeader hearing={hearing} context={context} showWitnesses={!grouped} />
+
+      {/* Who testified, grouped industry → organization → witness. Renders only
+          once an admin has filled in records; sits with the other context, above
+          the trust banner, so the banner stays the last thing before the words. */}
+      <HearingWitnesses witnesses={context.witnesses} />
 
       {/* Trust-tier banner — the reader-facing signal above the quotes.
           draft (raw) · attributed (AI-assisted) · verified (human-verified). */}
@@ -63,7 +59,7 @@ export default function HearingTranscriptPage() {
         </p>
       ) : (
         <>
-          <div className="flex items-center gap-3 mb-4">
+          <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-4">
             <h2 className="text-lg font-semibold text-gray-800">Transcript</h2>
             <span className="text-xs text-gray-400 capitalize">
               {transcript.source.replace(/_/g, ' ')} · {transcript.status}
@@ -71,8 +67,20 @@ export default function HearingTranscriptPage() {
             <span className="text-xs text-gray-400">
               {transcript.turns.length} turn{transcript.turns.length !== 1 ? 's' : ''}
             </span>
+            {watchFromStart && (
+              <a
+                href={watchFromStart}
+                target="_blank"
+                rel="noopener noreferrer"
+                title="Open the hearing video on YouTube"
+                className="ml-auto inline-flex items-baseline gap-1 text-xs text-slate-500 transition-colors hover:text-slate-900"
+              >
+                <span aria-hidden className="text-[9px]">▶</span>
+                Watch the full hearing
+              </a>
+            )}
           </div>
-          <TranscriptView transcript={transcript} />
+          <TranscriptView transcript={transcript} videoUrl={hearing.video_url} />
         </>
       )}
 

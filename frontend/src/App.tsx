@@ -14,6 +14,7 @@ import RegisterPage from './pages/RegisterPage'
 import AdminRoute from './components/AdminRoute'
 import AdminDashboardPage from './pages/AdminDashboardPage'
 import ReviewWorkbenchPage from './pages/ReviewWorkbenchPage'
+import WitnessEditorPage from './pages/WitnessEditorPage'
 
 // Fetches /me on mount and syncs result into Zustand auth store
 function AuthInit() {
@@ -41,6 +42,7 @@ export default function App() {
           <Route path="admin" element={<AdminRoute />}>
             <Route index element={<AdminDashboardPage />} />
             <Route path="hearings/:id/review" element={<ReviewWorkbenchPage />} />
+            <Route path="hearings/:id/witnesses" element={<WitnessEditorPage />} />
           </Route>
         </Route>
       </Routes>

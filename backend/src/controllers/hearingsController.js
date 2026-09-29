@@ -1,4 +1,5 @@
 const db = require('../utils/db');
+const { industryLabel } = require('../utils/witnessIndustries');
 
 async function listHearings(req, res) {
   try {
@@ -110,6 +111,7 @@ async function getHearingTranscript(req, res) {
     `, [req.params.id]);
 
     if (!hearingRows.length) return res.status(404).json({ error: 'Hearing not found' });
+    const hearing = hearingRows[0];
 
     const { rows: txRows } = await db.query(`
       SELECT * FROM transcripts
@@ -119,7 +121,10 @@ async function getHearingTranscript(req, res) {
     `, [req.params.id]);
 
     if (!txRows.length) {
-      return res.json({ data: { hearing: hearingRows[0], transcript: null } });
+      // Same shape either way, so the reader page never has to branch on it.
+      return res.json({
+        data: { hearing, transcript: null, context: { participants: [], witnesses: [], topics: [] } },
+      });
     }
 
     const transcript = txRows[0];
@@ -175,7 +180,108 @@ async function getHearingTranscript(req, res) {
       end_seq: s.next_seq != null ? s.next_seq - 1 : lastSeq,
     }));
 
-    res.json({ data: { hearing: hearingRows[0], transcript: { ...transcript, turns, sections: withRanges } } });
+    // ── Reader context ──────────────────────────────────────────────────────
+    // Who was in the room and what was covered. All three lists are DERIVED
+    // from the attributed turns, not stored: participants are the roster
+    // members who actually spoke (NOT the committee roster), witnesses are the
+    // named non-members, topics are the union of the per-turn tags. Each
+    // excludes blank admin-inserted turns exactly as the turn query does, so
+    // the counts always describe what a reader can actually read.
+    const { rows: participants } = await db.query(`
+      SELECT m.id, m.full_name, m.party, m.state, m.chamber,
+             count(*)::int    AS turn_count,
+             min(st.seq)::int AS first_seq,
+             r.role           AS committee_role,
+             COALESCE(bool_or(st.speaker_role = 'chair'), false) AS chaired
+        FROM speaker_turns st
+        JOIN members m ON m.id = st.member_id
+        -- Chair / ranking member, from the roster of THIS hearing's committee.
+        -- LATERAL rather than a plain join: a member has one membership row per
+        -- congress, and a second row would double every turn_count.
+        LEFT JOIN LATERAL (
+          SELECT cm.role
+            FROM committee_memberships cm
+           WHERE cm.committee_id = $2 AND cm.member_id = m.id
+           ORDER BY (cm.congress = $3) DESC NULLS LAST, cm.congress DESC NULLS LAST
+           LIMIT 1
+        ) r ON true
+       WHERE st.transcript_id = $1 AND st.raw_text <> ''
+       GROUP BY m.id, r.role
+       ORDER BY CASE r.role WHEN 'chair' THEN 0 WHEN 'ranking_member' THEN 1 ELSE 2 END,
+                min(st.seq)
+    `, [transcript.id, hearing.committee_id, hearing.congress]);
+
+    // Witnesses. Two sources, FULL OUTER JOINed on the speaker_name link:
+    //   spoke — the non-member speakers the transcript itself yields
+    //   rec   — the admin-entered hearing_witnesses records
+    // A witness may be in either or both: a detected speaker with no record yet
+    // still reads as a bare name (the Slice 2 behaviour), and a record whose
+    // witness never spoke (written testimony only) is still listed with zero
+    // turns. BOTH SIDES ARE SCOPED IN THEIR OWN CTE — putting hearing_id in a
+    // FULL OUTER JOIN's ON clause would leak every OTHER hearing's witnesses in
+    // as unmatched right-hand rows.
+    const { rows: witnessRows } = await db.query(`
+      WITH spoke AS (
+        SELECT st.speaker_name  AS name,
+               count(*)::int    AS turn_count,
+               min(st.seq)::int AS first_seq
+          FROM speaker_turns st
+         WHERE st.transcript_id = $1 AND st.raw_text <> ''
+           AND st.member_id IS NULL
+           AND COALESCE(btrim(st.speaker_name), '') <> ''
+           -- Committee staff are in the room but are not witnesses.
+           -- Unattributed turns have no speaker_name and never reach this list.
+           AND COALESCE(st.speaker_role, 'unknown') <> 'staff'
+         GROUP BY st.speaker_name
+      ), rec AS (
+        SELECT id, speaker_name, display_name, title, organization,
+               industry, industry_custom, display_order
+          FROM hearing_witnesses
+         WHERE hearing_id = $2
+      )
+      SELECT COALESCE(w.display_name, s.name) AS name,
+             w.title,
+             w.organization,
+             w.industry,
+             w.industry_custom,
+             COALESCE(s.turn_count, 0)  AS turn_count,
+             s.first_seq,
+             (w.id IS NOT NULL)         AS has_record
+        FROM spoke s
+        FULL OUTER JOIN rec w ON w.speaker_name = s.name
+       -- Records lead in the order the admin arranged them; anyone detected but
+       -- not yet entered follows in the order they spoke.
+       ORDER BY w.display_order NULLS LAST, s.first_seq NULLS LAST, 1
+    `, [transcript.id, hearing.id]);
+
+    // industry_label is resolved HERE rather than on the client so the public
+    // page needs no copy of the vocabulary: a custom label wins on 'other', and
+    // a witness with no record has no industry at all.
+    const witnesses = witnessRows.map((w) => ({
+      ...w,
+      industry_label: w.industry ? industryLabel(w.industry, w.industry_custom) : null,
+    }));
+
+    // Hearing-level topics don't exist as a row anywhere: tagging is per turn,
+    // so the hearing's topics are the distinct tags across its turns, ordered by
+    // how much of the hearing each one accounts for.
+    const { rows: topics } = await db.query(`
+      SELECT t.id, t.slug, t.name, count(DISTINCT st.id)::int AS turn_count
+        FROM turn_topics tt
+        JOIN topics t ON t.id = tt.topic_id
+        JOIN speaker_turns st ON st.id = tt.turn_id
+       WHERE st.transcript_id = $1 AND st.raw_text <> ''
+       GROUP BY t.id, t.slug, t.name
+       ORDER BY count(DISTINCT st.id) DESC, t.name
+    `, [transcript.id]);
+
+    res.json({
+      data: {
+        hearing,
+        transcript: { ...transcript, turns, sections: withRanges },
+        context: { participants, witnesses, topics },
+      },
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Internal server error' });

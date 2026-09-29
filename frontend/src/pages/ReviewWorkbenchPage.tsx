@@ -1152,6 +1152,14 @@ export default function ReviewWorkbenchPage() {
           <span className="text-sm text-gray-500"><span className="font-medium">{reviewed} / {totalSpeakers}</span> speakers reviewed{pendingSpeakers > 0 && ` · ${pendingSpeakers} pending`}</span>
 
           <div className="ml-auto flex items-center gap-2">
+            {/* Witness records (title / organization / industry) live on their own
+                page — a form with one Save, not this page's per-action model. */}
+            <Link
+              to={`/admin/hearings/${id}/witnesses`}
+              title="Enter witness titles, organizations and industries"
+              className="text-sm font-medium px-3 py-1.5 rounded-lg border border-gray-300 text-slate-700 hover:bg-white">
+              Witnesses
+            </Link>
             {sections.length > 0 && (
               <button
                 onClick={() => redetect.mutate(undefined, {
