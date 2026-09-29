@@ -2,6 +2,7 @@ import type { PublicSection, SectionType } from '../types/api'
 import { phaseAnchorId, sectionAnchorId, sectionTitle, type PhaseGroup, type SectionLike } from '../utils/sectionPhases'
 import { formatTimecode } from '../utils/timecode'
 import { cn } from '../utils/cn'
+import { useHearingVideo } from './HearingVideo'
 
 // ============================================================================
 //  The document's structural type — the sans-serif scaffolding that frames the
@@ -28,23 +29,30 @@ const KIND_LABEL: Record<SectionType, string> = {
 }
 
 /**
- * "▶ Watch" — deep-links the hearing video to the moment this header starts.
+ * "▶ Watch" — plays the hearing video from the moment this header starts.
+ * With the docked player available a plain click seeks it in place; the href is
+ * still the YouTube deep link, so a modified click (or no player) opens a tab.
  * Deliberately quiet: it sits at the end of the header line in the same muted
  * grey as the timecode and only gains colour on hover, so a reader scanning the
  * document is never pulled away from the text.
  */
-export function WatchLink({ href, at, label }: { href: string; at: string; label: string }) {
+export function WatchLink({ href, ms, label }: { href: string; ms: number; label: string }) {
+  const { canSeek, seekClick } = useHearingVideo()
+  const at = formatTimecode(ms)
   return (
     <a
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      title={`Watch ${label} on video (opens at ${at})`}
+      onClick={seekClick(ms)}
+      title={canSeek ? `Play ${label} from ${at}` : `Watch ${label} on video (opens at ${at})`}
       className="inline-flex shrink-0 items-baseline gap-1 text-xs text-slate-500 transition-colors hover:text-slate-900"
     >
       <span aria-hidden className="text-[9px]">▶</span>
       Watch
-      <span className="sr-only"> {label} on video, opens at {at} in a new tab</span>
+      <span className="sr-only">
+        {' '}{label} {canSeek ? `in the video player, from ${at}` : `on video, opens at ${at} in a new tab`}
+      </span>
     </a>
   )
 }
@@ -71,7 +79,7 @@ export function PhaseHeading({ group, index, startMs, watchHref }: {
         </h2>
         {watchHref && startMs != null && (
           <span className="ml-auto">
-            <WatchLink href={watchHref} at={formatTimecode(startMs)} label={group.label} />
+            <WatchLink href={watchHref} ms={startMs} label={group.label} />
           </span>
         )}
       </div>
@@ -112,7 +120,7 @@ export function SectionHeading({ section, startMs, watchHref, opensPhase }: {
           <time className="text-xs tabular-nums text-slate-500">{formatTimecode(startMs)}</time>
         )}
         {watchHref && startMs != null && (
-          <WatchLink href={watchHref} at={formatTimecode(startMs)} label={title} />
+          <WatchLink href={watchHref} ms={startMs} label={title} />
         )}
       </span>
     </header>

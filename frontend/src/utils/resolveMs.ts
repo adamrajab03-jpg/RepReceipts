@@ -6,7 +6,7 @@ import type { WordTime } from '../types/api'
  * closest to charStart. Used to convert a quote's char_start into a video
  * timestamp for display.
  *
- * The text scan mirrors the tokenizer in SpeakerTurn: it finds each word's
+ * The text scan mirrors utils/tokenizeTurn: it finds each word's
  * exact index in the canonical string using indexOf(), so positions stay
  * accurate regardless of spacing variations.
  */

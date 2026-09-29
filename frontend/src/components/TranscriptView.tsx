@@ -1,9 +1,11 @@
-import { useMemo } from 'react'
+import { useMemo, useRef } from 'react'
 import type { Transcript } from '../types/api'
 import SpeakerTurn from './SpeakerTurn'
 import TranscriptOutline, { TranscriptOutlineBar } from './TranscriptOutline'
 import { PhaseHeading, SectionHeading } from './TranscriptHeadings'
+import { HearingVideoPanel, useSidebarBreakout } from './HearingVideo'
 import { useActiveAnchor } from '../hooks/useActiveAnchor'
+import { useIsDesktop } from '../hooks/useMediaQuery'
 import { groupIntoPhases, layoutHeaders, sectionAnchorId } from '../utils/sectionPhases'
 import { youtubeWatchAt } from '../utils/youtube'
 import { cn } from '../utils/cn'
@@ -50,6 +52,17 @@ export default function TranscriptView({ transcript, videoUrl }: {
   )
   const active = useActiveAnchor(sectionAnchors)
 
+  // One player per page, so exactly one of the three placements renders it:
+  // the sidebar (desktop), the sticky bar's mini-player (mobile), or — for a
+  // hearing with no sections, hence no sidebar or bar — a card above the text.
+  // The CSS `lg:hidden` / `hidden lg:flex` alone would still mount both.
+  const isDesktop = useIsDesktop()
+  const hasOutline = groups.length > 0
+  // Spans the page container, so it measures the margins the sidebar player
+  // can grow into (the grid itself moves when it does).
+  const shellRef = useRef<HTMLDivElement>(null)
+  const breakout = useSidebarBreakout(shellRef, isDesktop && hasOutline)
+
   if (!transcript.turns.length) {
     return (
       <p className="text-sm text-gray-500 py-12 text-center">
@@ -65,17 +78,24 @@ export default function TranscriptView({ transcript, videoUrl }: {
   }
 
   return (
-    <div>
+    <div ref={shellRef}>
       {/* Mobile position indicator + drawer. Lives outside the grid so its
           sticky containing block spans the whole transcript. */}
-      <TranscriptOutlineBar {...outline} />
+      <TranscriptOutlineBar {...outline} showVideo={!isDesktop} />
+
+      {!hasOutline && <HearingVideoPanel className="mb-4 max-w-md" />}
 
       {/* Two columns only when there is an outline to put in the first one — an
           unsectioned hearing reads full width instead of against a blank gutter.
           `items-start` is what lets the sidebar be sticky: without it the grid
           stretches the cell to full height and there is nowhere to travel. */}
-      <div className={cn(groups.length && 'lg:grid lg:grid-cols-[15rem_minmax(0,1fr)] lg:gap-8 lg:items-start')}>
-        <TranscriptOutline {...outline} />
+      <div
+        className={cn(hasOutline && 'lg:grid lg:grid-cols-[15rem_minmax(0,1fr)] lg:gap-8 lg:items-start')}
+        // A resized player: sidebar out to the left, transcript shifted right at
+        // its usual width (see useSidebarBreakout). Desktop only.
+        style={breakout}
+      >
+        <TranscriptOutline {...outline} showVideo={isDesktop} />
 
         <article className="rounded-lg border border-gray-200 bg-white px-5 pb-8 sm:px-10">
           {transcript.turns.map((turn, i) => {

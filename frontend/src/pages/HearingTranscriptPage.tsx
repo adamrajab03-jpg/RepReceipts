@@ -8,6 +8,7 @@ import CommentThread from '../components/CommentThread'
 import { tierBanner } from '../utils/hearingTier'
 import { youtubeWatchAt } from '../utils/youtube'
 import { cn } from '../utils/cn'
+import { HearingVideoProvider, useHearingVideo } from '../components/HearingVideo'
 
 export default function HearingTranscriptPage() {
   const { id } = useParams<{ id: string }>()
@@ -26,6 +27,9 @@ export default function HearingTranscriptPage() {
   const watchFromStart = youtubeWatchAt(hearing.video_url, 0)
 
   return (
+    // One docked player for the page: the sidebar hosts it, and every "▶ Watch"
+    // (headers, outline, "Watch the full hearing") seeks it.
+    <HearingVideoProvider videoUrl={hearing.video_url}>
     <div>
       <Link to="/hearings" className="text-sm text-gray-500 hover:text-gray-700 mb-4 inline-block">
         ← Back to Hearings
@@ -68,16 +72,7 @@ export default function HearingTranscriptPage() {
               {transcript.turns.length} turn{transcript.turns.length !== 1 ? 's' : ''}
             </span>
             {watchFromStart && (
-              <a
-                href={watchFromStart}
-                target="_blank"
-                rel="noopener noreferrer"
-                title="Open the hearing video on YouTube"
-                className="ml-auto inline-flex items-baseline gap-1 text-xs text-slate-500 transition-colors hover:text-slate-900"
-              >
-                <span aria-hidden className="text-[9px]">▶</span>
-                Watch the full hearing
-              </a>
+              <WatchFullHearing href={watchFromStart} />
             )}
           </div>
           <TranscriptView transcript={transcript} videoUrl={hearing.video_url} />
@@ -95,5 +90,24 @@ export default function HearingTranscriptPage() {
         </div>
       </div>
     </div>
+    </HearingVideoProvider>
+  )
+}
+
+/** "Watch the full hearing" — plays the docked player from the top, or opens YouTube without one. */
+function WatchFullHearing({ href }: { href: string }) {
+  const { canSeek, seekClick } = useHearingVideo()
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={seekClick(0)}
+      title={canSeek ? 'Play the hearing from the start' : 'Open the hearing video on YouTube'}
+      className="ml-auto inline-flex items-baseline gap-1 text-xs text-slate-500 transition-colors hover:text-slate-900"
+    >
+      <span aria-hidden className="text-[9px]">▶</span>
+      Watch the full hearing
+    </a>
   )
 }

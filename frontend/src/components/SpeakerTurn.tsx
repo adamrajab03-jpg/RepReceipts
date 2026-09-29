@@ -1,13 +1,11 @@
-import { useRef, useState, useEffect, useMemo } from 'react'
+import { useRef, useState, useEffect } from 'react'
 import { createPortal } from 'react-dom'
 import { Link } from 'react-router-dom'
 import type { SpeakerTurn as Turn } from '../types/api'
 import { useAuthStore } from '../store/authStore'
-import WordToken from './WordToken'
 import CommentThread from './CommentThread'
 import CommentForm from './CommentForm'
 import { cn } from '../utils/cn'
-import { tokenizeText, type Token } from '../utils/tokenizeTurn'
 import { formatTimecode } from '../utils/timecode'
 import { memberLabel, partyPillClass, partyStateLabel } from '../utils/memberDisplay'
 
@@ -17,22 +15,18 @@ type QuoteState =
   | { phase: 'popover'; charStart: number; charEnd: number; text: string; anchorRect: DOMRect }
   | { phase: 'form';    charStart: number; charEnd: number; text: string }
 
-// ── Renderer — interleaves span tokens with literal text gaps ─────────────────
-// Tokens tile the canonical text exactly (see utils/tokenizeTurn), so every
-// character between them — every space — is emitted verbatim from `text` and
-// paragraph.textContent === text, character for character. Tokens carry their
-// own slice of the text rather than a word from word_times, so a turn with
-// accepted edits reads exactly as clean_text does.
-function renderTokens(text: string, tokens: Token[], turnId: string): React.ReactNode[] {
-  const nodes: React.ReactNode[] = []
-  let pos = 0
-  tokens.forEach((t, i) => {
-    if (t.charStart > pos) nodes.push(text.substring(pos, t.charStart))
-    nodes.push(<WordToken key={i} word={text.substring(t.charStart, t.charEnd)} turnId={turnId} timing={t.wt} />)
-    pos = t.charEnd
-  })
-  if (pos < text.length) nodes.push(text.substring(pos))
-  return nodes
+// ── Quote popover placement ───────────────────────────────────────────────────
+// Viewport coordinates for a position: fixed popover, centred under the
+// selection — or above it when the selection sits near the bottom of the
+// screen — and kept clear of the viewport's side edges.
+const POPOVER_H = 32
+const POPOVER_HALF_W = 80
+function popoverPosition(rect: DOMRect): React.CSSProperties {
+  const below = rect.bottom + 6
+  const top = below + POPOVER_H > window.innerHeight - 8 ? rect.top - 6 - POPOVER_H : below
+  const vw = document.documentElement.clientWidth
+  const centre = Math.min(Math.max(rect.left + rect.width / 2, POPOVER_HALF_W + 8), vw - POPOVER_HALF_W - 8)
+  return { top: Math.max(8, top), left: centre, transform: 'translateX(-50%)' }
 }
 
 // ── Speaker label ─────────────────────────────────────────────────────────────
@@ -74,52 +68,96 @@ export default function SpeakerTurn({ turn, index, startsSection = false }: {
   const partyState  = partyStateLabel(turn.party, turn.state)
   const roleLabel   = turn.speaker_role ? ROLE_LABEL[turn.speaker_role] ?? '' : ''
   const text        = turn.clean_text ?? turn.raw_text
-  // Aligning word_times to the text costs real work on a long turn — do it once
-  // per turn, not on every hover/selection re-render.
-  const tokens      = useMemo(() => tokenizeText(text, turn.word_times), [text, turn.word_times])
-  // Words that survived this turn's accepted edits keep their timing; a word an
-  // edit removed or replaced beyond recovery has none, so count what is actually
-  // hoverable rather than the raw word_times length.
-  const timedWords  = tokens.reduce((n, t) => (t.wt ? n + 1 : n), 0)
 
   // ── Quote selection ─────────────────────────────────────────────────────────
-  function handleMouseUp() {
+  // The paragraph's selected part, kept so the popover can follow it on scroll.
+  const quoteRangeRef = useRef<Range | null>(null)
+
+  // Read the current selection as a quote of THIS turn: char offsets into
+  // `text` (the paragraph's textContent === clean_text ?? raw_text). A selection
+  // that spills past the paragraph — dragged up into the speaker label, or on
+  // into the next turn — is clipped to it rather than rejected, and surrounding
+  // whitespace is trimmed off the span, so the stored offsets are exactly the
+  // quoted words.
+  function captureSelection() {
     if (!user) return
     const sel = window.getSelection()
-    if (!sel || sel.isCollapsed || !sel.rangeCount) return
-
-    const range     = sel.getRangeAt(0)
     const container = paragraphRef.current
-    if (!container?.contains(range.commonAncestorContainer)) return
+    if (!sel || sel.isCollapsed || !sel.rangeCount || !container) return
 
-    const selectedText = range.toString()
-    if (!selectedText.trim()) return
+    const range = sel.getRangeAt(0)
+    if (!range.intersectsNode(container)) return
 
-    // char offsets into paragraph.textContent (=== clean_text ?? raw_text)
-    const before = document.createRange()
-    before.setStart(container, 0)
-    before.setEnd(range.startContainer, range.startOffset)
-    const charStart = before.toString().length
-    const charEnd   = charStart + selectedText.length
+    const whole = document.createRange()
+    whole.selectNodeContents(container)
+    const offsetOf = (node: Node, offset: number) => {
+      const r = document.createRange()
+      r.setStart(container, 0)
+      r.setEnd(node, offset)
+      return r.toString().length
+    }
+    const startsInside = range.compareBoundaryPoints(Range.START_TO_START, whole) > 0
+    const endsInside   = range.compareBoundaryPoints(Range.END_TO_END, whole) < 0
+    let charStart = startsInside ? offsetOf(range.startContainer, range.startOffset) : 0
+    let charEnd   = endsInside ? offsetOf(range.endContainer, range.endOffset) : text.length
+    while (charStart < charEnd && /\s/.test(text[charStart])) charStart++
+    while (charEnd > charStart && /\s/.test(text[charEnd - 1])) charEnd--
+    if (charStart >= charEnd) return
+
+    const clipped = range.cloneRange()
+    if (!startsInside) clipped.setStart(whole.startContainer, whole.startOffset)
+    if (!endsInside)   clipped.setEnd(whole.endContainer, whole.endOffset)
+    quoteRangeRef.current = clipped
 
     setQuoteState({
       phase: 'popover',
       charStart,
       charEnd,
-      text: selectedText,
-      anchorRect: range.getBoundingClientRect(),
+      text: text.slice(charStart, charEnd),
+      anchorRect: clipped.getBoundingClientRect(),
     })
   }
 
-  // Dismiss popover when the user clears their selection
+  // A drag that starts in the paragraph often ENDS outside it — the measure is
+  // capped at 70ch, so pulling to the end of a line releases over the margin.
+  // Listening for mouseup on the paragraph missed exactly those selections, so
+  // arm a one-shot document-level listener on press instead.
+  function handlePointerDown(e: React.PointerEvent) {
+    if (!user || e.button !== 0) return
+    const onUp = () => {
+      document.removeEventListener('pointerup', onUp)
+      // After the browser has finalised the selection for this release.
+      requestAnimationFrame(captureSelection)
+    }
+    document.addEventListener('pointerup', onUp)
+  }
+
+  // While the popover is up: dismiss it when the selection is cleared, and keep
+  // it pinned to the selection as the page scrolls (it is position: fixed, so
+  // its coordinates are viewport-relative and go stale on scroll).
   useEffect(() => {
     if (quoteState.phase !== 'popover') return
-    const handler = () => {
+    const onSelection = () => {
       const sel = window.getSelection()
       if (!sel || sel.isCollapsed) setQuoteState({ phase: 'idle' })
     }
-    document.addEventListener('selectionchange', handler)
-    return () => document.removeEventListener('selectionchange', handler)
+    let frame = 0
+    const onScroll = () => {
+      cancelAnimationFrame(frame)
+      frame = requestAnimationFrame(() => {
+        const r = quoteRangeRef.current
+        if (r) setQuoteState(s => (s.phase === 'popover' ? { ...s, anchorRect: r.getBoundingClientRect() } : s))
+      })
+    }
+    document.addEventListener('selectionchange', onSelection)
+    window.addEventListener('scroll', onScroll, true)
+    window.addEventListener('resize', onScroll)
+    return () => {
+      cancelAnimationFrame(frame)
+      document.removeEventListener('selectionchange', onSelection)
+      window.removeEventListener('scroll', onScroll, true)
+      window.removeEventListener('resize', onScroll)
+    }
   }, [quoteState.phase])
 
   function openQuoteForm() {
@@ -183,21 +221,19 @@ export default function SpeakerTurn({ turn, index, startsSection = false }: {
         </div>
       )}
 
-      {/* Word-token paragraph — textContent === clean_text ?? raw_text.
+      {/* The testimony as plain prose — one text node, so textContent ===
+          clean_text ?? raw_text and a selection's char offsets (quotes) index
+          straight into the canonical text. Word timing is NOT rendered; it stays
+          in turn.word_times, and utils/tokenizeTurn maps text positions onto it
+          (edit-aware) whenever a feature needs a word's time.
           Serif, ~1.75 leading, measure capped near 70ch: the reading layer. */}
       <p
         ref={paragraphRef}
-        onMouseUp={handleMouseUp}
+        onPointerDown={handlePointerDown}
         className="max-w-[70ch] cursor-text select-text font-serif text-[17px] leading-[1.75] text-slate-800"
       >
-        {renderTokens(text, tokens, turn.id)}
+        {text}
       </p>
-
-      {timedWords > 0 && (
-        <p className="mt-1.5 text-[11px] text-slate-400">
-          {timedWords} word timestamps — hover each word to inspect ms range
-        </p>
-      )}
 
       {/* Quote form (inline, replaces popover after "Quote & Comment" click) */}
       {quoteState.phase === 'form' && (
@@ -228,16 +264,16 @@ export default function SpeakerTurn({ turn, index, startsSection = false }: {
         defaultCollapsed
       />
 
-      {/* Quote & Comment popover — fixed, portalled to avoid overflow clipping */}
-      {/* TODO: add touchend handler for mobile quote-selection */}
+      {/* Quote & Comment popover — fixed, portalled to avoid overflow clipping.
+          getBoundingClientRect() is ALREADY viewport-relative, which is what
+          position: fixed wants — adding window.scrollY (as this used to) pushed
+          the popover off the bottom of the screen on any turn more than a
+          viewport down the page, i.e. effectively all testimony. */}
+      {/* TODO: mobile quote-selection (long-press selection handles fire no pointerup) */}
       {quoteState.phase === 'popover' && createPortal(
         <div
           className="fixed z-50 flex items-center gap-1.5 bg-slate-800 text-white text-xs px-3 py-1.5 rounded-lg shadow-lg pointer-events-auto"
-          style={{
-            top:       quoteState.anchorRect.bottom + window.scrollY + 6,
-            left:      quoteState.anchorRect.left + quoteState.anchorRect.width / 2 + window.scrollX,
-            transform: 'translateX(-50%)',
-          }}
+          style={popoverPosition(quoteState.anchorRect)}
         >
           <span>💬</span>
           <button
