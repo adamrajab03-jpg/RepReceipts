@@ -9,9 +9,17 @@ import { tierBanner } from '../utils/hearingTier'
 import { youtubeWatchAt } from '../utils/youtube'
 import { cn } from '../utils/cn'
 import { HearingVideoProvider, useHearingVideo } from '../components/HearingVideo'
+import { CitationNotFound, CitationVideoCue } from '../components/CitationReceipt'
+import type { CitationView } from '../types/api'
 
-export default function HearingTranscriptPage() {
-  const { id } = useParams<{ id: string }>()
+export default function HearingTranscriptPage({ hearingId, citation }: {
+  /** Given by CitationPage (/q/:code); otherwise the :id route param. */
+  hearingId?: string
+  /** A shared quote this page was opened for. */
+  citation?: CitationView
+} = {}) {
+  const params = useParams<{ id: string }>()
+  const id = hearingId ?? params.id
   const { data, isLoading, isError } = useHearingTranscript(id!)
 
   if (isLoading) return <p className="text-sm text-gray-500">Loading…</p>
@@ -26,6 +34,14 @@ export default function HearingTranscriptPage() {
   // Null unless the hearing has a usable YouTube URL (/live/, /watch?v=, youtu.be).
   const watchFromStart = youtubeWatchAt(hearing.video_url, 0)
 
+  // A shared quote counts as located only if every segment the resolver found
+  // is a turn this page actually rendered. (The two requests are separate; if
+  // the transcript changed between them, show the receipt rather than a
+  // highlight that might land on the wrong words.)
+  const located = !!citation && citation.resolution.status !== 'not_found' &&
+    !!transcript && citation.resolution.segments.length > 0 &&
+    citation.resolution.segments.every((s) => transcript.turns.some((t) => t.id === s.turn_id))
+
   return (
     // One docked player for the page: the sidebar hosts it, and every "▶ Watch"
     // (headers, outline, "Watch the full hearing") seeks it.
@@ -34,6 +50,12 @@ export default function HearingTranscriptPage() {
       <Link to="/hearings" className="text-sm text-gray-500 hover:text-gray-700 mb-4 inline-block">
         ← Back to Hearings
       </Link>
+
+      {/* A shared quote: park the player at its moment (no autoplay). When the
+          passage can't be located, the receipt itself leads the page — it is
+          what the reader came for, and there is no highlight to scroll to. */}
+      {citation && <CitationVideoCue seekMs={citation.citation.seek_ms} />}
+      {citation && !located && <CitationNotFound view={citation} videoUrl={hearing.video_url} />}
 
       {/* Hearing identity + reading context (committee, members, topics, and
           witnesses too when no records have been entered yet) */}
@@ -75,7 +97,7 @@ export default function HearingTranscriptPage() {
               <WatchFullHearing href={watchFromStart} />
             )}
           </div>
-          <TranscriptView transcript={transcript} videoUrl={hearing.video_url} />
+          <TranscriptView transcript={transcript} videoUrl={hearing.video_url} citation={located ? citation : null} />
         </>
       )}
 

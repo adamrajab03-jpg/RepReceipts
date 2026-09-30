@@ -16,6 +16,8 @@ export interface YTPlayer {
   playVideo(): void
   pauseVideo(): void
   destroy(): void
+  /** Load a video at a start time WITHOUT playing it (the thumbnail shows). */
+  cueVideoById(opts: { videoId: string; startSeconds?: number }): void
 }
 
 interface YTPlayerOptions {

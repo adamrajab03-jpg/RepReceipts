@@ -34,6 +34,13 @@ interface HearingVideo {
   failed: boolean
   setExpanded: (v: boolean) => void
   seek: (ms: number) => void
+  /**
+   * Park the player at a moment WITHOUT playing it — a shared quote's landing
+   * page cues its moment, and the reader presses play (browsers block autoplay
+   * with sound, and starting a video unasked would be pushy anyway). Applies
+   * whenever the player next becomes ready; a seek() supersedes it.
+   */
+  cue: (ms: number) => void
   /** onClick for an <a href=youtube…>: plain clicks seek; modified clicks still open the tab. */
   seekClick: (ms: number) => ((e: MouseEvent) => void) | undefined
   /** Reader-chosen player widths in px (null = the layout's default), per placement. */
@@ -58,7 +65,7 @@ interface Internal {
 
 const NONE: HearingVideo = {
   videoId: null, canSeek: false, expanded: false, activated: false, failed: false,
-  setExpanded: () => {}, seek: () => {}, seekClick: () => undefined,
+  setExpanded: () => {}, seek: () => {}, cue: () => {}, seekClick: () => undefined,
   sidebarWidth: null, floatWidth: null, setSidebarWidth: () => {}, setFloatWidth: () => {},
   sidebarMax: 0, setSidebarMax: () => {},
 }
@@ -109,6 +116,9 @@ export function HearingVideoProvider({ videoUrl, children }: { videoUrl: string 
 
   const player = useRef<YTPlayer | null>(null)
   const pending = useRef<number | null>(null)
+  const cued = useRef<number | null>(null)
+  const videoIdRef = useRef(videoId)
+  videoIdRef.current = videoId
 
   const play = (p: YTPlayer, seconds: number) => {
     p.seekTo(seconds, true)
@@ -123,9 +133,17 @@ export function HearingVideoProvider({ videoUrl, children }: { videoUrl: string 
 
   const seek = useCallback((ms: number) => {
     const seconds = Math.max(0, Math.floor(ms / 1000))
+    cued.current = null
     setChoice(true)
     if (player.current) play(player.current, seconds)
     else pending.current = seconds
+  }, [])
+
+  const cue = useCallback((ms: number) => {
+    const seconds = Math.max(0, Math.floor(ms / 1000))
+    cued.current = seconds
+    const id = videoIdRef.current
+    if (player.current && id) player.current.cueVideoById({ videoId: id, startSeconds: seconds })
   }, [])
 
   const canSeek = !!videoId && !failed
@@ -145,6 +163,8 @@ export function HearingVideoProvider({ videoUrl, children }: { videoUrl: string 
       if (pending.current != null) {
         play(p, pending.current)
         pending.current = null
+      } else if (cued.current != null && videoIdRef.current) {
+        p.cueVideoById({ videoId: videoIdRef.current, startSeconds: cued.current })
       }
     },
     gone: () => { player.current = null },
@@ -158,10 +178,10 @@ export function HearingVideoProvider({ videoUrl, children }: { videoUrl: string 
 
   const value = useMemo<HearingVideo>(
     () => ({
-      videoId, canSeek, expanded, activated, failed, setExpanded, seek, seekClick,
+      videoId, canSeek, expanded, activated, failed, setExpanded, seek, cue, seekClick,
       sidebarWidth, floatWidth, setSidebarWidth, setFloatWidth, sidebarMax, setSidebarMax,
     }),
-    [videoId, canSeek, expanded, activated, failed, setExpanded, seek, seekClick, sidebarWidth, floatWidth, sidebarMax],
+    [videoId, canSeek, expanded, activated, failed, setExpanded, seek, cue, seekClick, sidebarWidth, floatWidth, sidebarMax],
   )
 
   return (

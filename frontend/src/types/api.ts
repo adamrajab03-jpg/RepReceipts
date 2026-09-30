@@ -41,6 +41,10 @@ export interface Hearing {
   committee_chamber: string | null
 }
 
+/** Where a turn's words came from (migration 015): speech recognition over the
+ *  audio, a reviewer's own transcription, or a merge of the two. */
+export type TextOrigin = 'asr' | 'human' | 'mixed'
+
 export interface WordTime {
   w: string
   s: number
@@ -115,6 +119,8 @@ export interface SpeakerTurn {
   clean_text: string | null
   word_times: WordTime[] | null
   is_edited: boolean
+  /** Who transcribed the turn's words: the audio ('asr'), a reviewer ('human'), or both. */
+  text_origin: TextOrigin
   member_full_name: string | null
   bioguide_id: string | null
   party: string | null
@@ -539,4 +545,65 @@ export interface ListResponse<T> {
 
 export interface DetailResponse<T> {
   data: T
+}
+
+// ── Citations (shareable quote receipts) ─────────────────────────────────────
+// The receipt as it was shared — immutable server-side (migration 014).
+export interface Citation {
+  code: string
+  hearing_id: string
+  hearing_title: string
+  hearing_held_on: string | null
+  anchor_turn_id: string | null
+  char_start: number
+  char_end: number
+  quoted_text: string
+  prefix: string
+  suffix: string
+  text_basis: 'clean' | 'raw'
+  anchor_start_ms: number | null
+  anchor_end_ms: number | null
+  /** Where playback should start (the quote's first word, or just before it). */
+  seek_ms: number | null
+  timing_basis: 'word' | 'nearby_word' | 'turn' | 'none'
+  member_id: string | null
+  witness_id: string | null
+  speaker_name: string
+  speaker_label_raw: string | null
+  speaker_role: string | null
+  speaker_party: string | null
+  speaker_state: string | null
+  speaker_chamber: string | null
+  attribution_status: string
+  hearing_status: string
+  /** Snapshotted at share time: did the quoted words come from the audio? */
+  text_origin: TextOrigin
+  created_at: string
+}
+
+export interface CitationSpeaker {
+  member_id: string | null
+  name: string
+  role: string | null
+  party: string | null
+  state: string | null
+  chamber: string | null
+}
+
+// Where that passage is in the transcript NOW (backend utils/citationResolve).
+export interface CitationResolution {
+  status: 'match' | 'diverged' | 'not_found'
+  change: 'formatting' | 'wording' | null
+  located_by: 'hint' | 'exact' | 'time' | 'turn' | null
+  similarity: number | null
+  segments: { turn_id: string; char_start: number; char_end: number }[]
+  current_text: string | null
+  current_speakers: CitationSpeaker[]
+  attribution_changed: boolean
+  mixed_speakers: boolean
+}
+
+export interface CitationView {
+  citation: Citation
+  resolution: CitationResolution
 }

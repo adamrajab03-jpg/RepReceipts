@@ -1,6 +1,7 @@
 const db = require('../utils/db');
 const { primaryTranscriptId } = require('./adminController');
 const { WITNESS_INDUSTRIES, isIndustry } = require('../utils/witnessIndustries');
+const { PUBLIC_TURN_FILTER } = require('../utils/publicTranscript');
 
 // ============================================================================
 //  ADMIN: witness records for a hearing.
@@ -24,7 +25,7 @@ const DETECTED_SQL = `
          min(st.seq)::int AS first_seq,
          array_agg(DISTINCT st.speaker_key) AS speaker_keys
     FROM speaker_turns st
-   WHERE st.transcript_id = $1 AND st.raw_text <> ''
+   WHERE st.transcript_id = $1 AND ${PUBLIC_TURN_FILTER}
      AND st.member_id IS NULL
      AND COALESCE(btrim(st.speaker_name), '') <> ''
      AND COALESCE(st.speaker_role, 'unknown') <> 'staff'

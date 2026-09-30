@@ -51,6 +51,13 @@ function splitAtWord(rawText, wordTimes, k) {
   const textA = rawText.slice(0, endA);
   const joiner = rawText.slice(endA, startB);
   const textB = rawText.slice(startB);
+  // The joiner belongs to NEITHER half — it is only recorded, for a byte-exact
+  // re-merge. It must therefore be whitespace: if untimed words sat between
+  // word k-1 and word k (timing that doesn't cover every word), they would
+  // vanish from both halves while the reconstruction check still passed.
+  if (/\S/.test(joiner)) {
+    throw { status: 422, message: 'Refusing split: words between these timed words have no timing and would be lost' };
+  }
   assertReconstruction(textA, joiner, textB, rawText, 'split');
   return { textA, joiner, textB, wtA: wordTimes.slice(0, k), wtB: wordTimes.slice(k) };
 }

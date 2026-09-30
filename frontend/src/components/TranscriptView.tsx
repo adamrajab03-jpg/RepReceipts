@@ -1,9 +1,10 @@
-import { useMemo, useRef } from 'react'
-import type { Transcript } from '../types/api'
+import { useEffect, useMemo, useRef } from 'react'
+import type { CitationView, Transcript } from '../types/api'
 import SpeakerTurn from './SpeakerTurn'
 import TranscriptOutline, { TranscriptOutlineBar } from './TranscriptOutline'
 import { PhaseHeading, SectionHeading } from './TranscriptHeadings'
 import { HearingVideoPanel, useSidebarBreakout } from './HearingVideo'
+import { CitationReceiptBar } from './CitationReceipt'
 import { useActiveAnchor } from '../hooks/useActiveAnchor'
 import { useIsDesktop } from '../hooks/useMediaQuery'
 import { groupIntoPhases, layoutHeaders, sectionAnchorId } from '../utils/sectionPhases'
@@ -19,9 +20,12 @@ import { cn } from '../utils/cn'
  * (see utils/sectionPhases), so re-sectioning in the admin workbench changes
  * what readers see here without any data migration.
  */
-export default function TranscriptView({ transcript, videoUrl }: {
+export default function TranscriptView({ transcript, videoUrl, citation }: {
   transcript: Transcript
   videoUrl?: string | null
+  /** A shared quote that was LOCATED in this transcript: highlight it, carry its
+   *  receipt bar on its first turn, and scroll to it on arrival. */
+  citation?: CitationView | null
 }) {
   const sections = transcript.sections ?? []
 
@@ -51,6 +55,27 @@ export default function TranscriptView({ transcript, videoUrl }: {
     [groups],
   )
   const active = useActiveAnchor(sectionAnchors)
+
+  const citeSegments = useMemo(
+    () => new Map((citation?.resolution.segments ?? []).map((s) => [s.turn_id, s])),
+    [citation],
+  )
+  const receiptTurnId = citation?.resolution.segments[0]?.turn_id
+
+  // Arriving from a quote link: bring the passage to the middle of the screen,
+  // once — after that the reader is in charge of the scroll position.
+  const scrolledFor = useRef<string | null>(null)
+  useEffect(() => {
+    const code = citation?.citation.code
+    if (!code || scrolledFor.current === code) return
+    const frame = requestAnimationFrame(() => {
+      const target = document.querySelector('[data-cite-mark]')
+      if (!target) return
+      scrolledFor.current = code
+      target.scrollIntoView({ block: 'center' })
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [citation, transcript.turns])
 
   // One player per page, so exactly one of the three placements renders it:
   // the sidebar (desktop), the sticky bar's mini-player (mobile), or — for a
@@ -124,7 +149,17 @@ export default function TranscriptView({ transcript, videoUrl }: {
                     </div>
                   )
                 })}
-                <SpeakerTurn turn={turn} index={i} startsSection={!!slots?.length} />
+                <SpeakerTurn
+                  turn={turn}
+                  index={i}
+                  startsSection={!!slots?.length}
+                  highlight={citeSegments.has(turn.id)
+                    ? { start: citeSegments.get(turn.id)!.char_start, end: citeSegments.get(turn.id)!.char_end }
+                    : undefined}
+                  receipt={citation && turn.id === receiptTurnId
+                    ? <CitationReceiptBar view={citation} videoUrl={videoUrl ?? null} />
+                    : undefined}
+                />
               </div>
             )
           })}

@@ -81,14 +81,17 @@ async function main() {
     if (!txRes.rows.length) throw new Error('No deepgram_batch transcript for this hearing.');
     const transcriptId = txRes.rows[0].id;
 
-    // Non-empty turns only — blank admin-inserted slots have nothing to clean.
+    // ASR text only. Cleanup exists to fix speech-recognition errors: a
+    // reviewer's own transcription ('human') is not ASR output, and a 'mixed'
+    // turn can't have proposals aimed at just its ASR part (proposals anchor to
+    // raw_text as a whole). Unfilled inserted slots have nothing to clean.
     const tRes = await client.query(
       `SELECT id, seq, raw_text FROM speaker_turns
-        WHERE transcript_id = $1 AND raw_text <> ''
+        WHERE transcript_id = $1 AND raw_text <> '' AND text_origin = 'asr'
         ORDER BY seq`,
       [transcriptId]
     );
-    if (!tRes.rows.length) throw new Error('Transcript has no non-empty speaker_turns.');
+    if (!tRes.rows.length) throw new Error('Transcript has no ASR speaker_turns to clean.');
     const turns = tRes.rows;
 
     console.log(`Hearing ${hearingId}: "${hearing.title}"`);

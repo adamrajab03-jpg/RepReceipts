@@ -13,6 +13,7 @@ const followsRouter  = require('./routes/follows');
 const notificationsRouter = require('./routes/notifications');
 const lookupRouter   = require('./routes/lookup');
 const adminRouter    = require('./routes/admin');
+const citationsRouter = require('./routes/citations');
 
 // ── CSRF (double-submit signed cookie, SameSite=Strict is primary defence) ───
 const {
@@ -54,6 +55,7 @@ app.get('/api/auth/csrf', (req, res) => {
 app.use('/api/auth',     authRouter);
 app.use('/api/members',  membersRouter);
 app.use('/api/hearings', hearingsRouter);
+app.use('/api/citations', citationsRouter);
 app.use('/api/turns',    turnsRouter);
 app.use('/api/comments', commentsRouter);
 app.use('/api/topics',   topicsRouter);

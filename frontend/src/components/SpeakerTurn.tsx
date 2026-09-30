@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect } from 'react'
+import { useRef, useState, useEffect, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Link } from 'react-router-dom'
 import type { SpeakerTurn as Turn } from '../types/api'
@@ -8,6 +8,9 @@ import CommentForm from './CommentForm'
 import { cn } from '../utils/cn'
 import { formatTimecode } from '../utils/timecode'
 import { memberLabel, partyPillClass, partyStateLabel } from '../utils/memberDisplay'
+import { createCitation, citationUrl } from '../hooks/useCitation'
+import { copyPending } from '../utils/clipboard'
+import { turnOriginNote } from '../utils/textOrigin'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type QuoteState =
@@ -15,19 +18,43 @@ type QuoteState =
   | { phase: 'popover'; charStart: number; charEnd: number; text: string; anchorRect: DOMRect }
   | { phase: 'form';    charStart: number; charEnd: number; text: string }
 
+// What the popover's "Copy link" is doing. Once a share has started, the
+// popover no longer depends on the selection (the offsets are captured), so it
+// stays up until it finishes or the reader dismisses it.
+type ShareState =
+  | { kind: 'idle' }
+  | { kind: 'busy' }
+  | { kind: 'copied' }
+  | { kind: 'manual'; url: string }      // clipboard refused — show the URL to copy by hand
+  | { kind: 'error'; message: string }
+
 // ── Quote popover placement ───────────────────────────────────────────────────
 // Viewport coordinates for a position: fixed popover, centred under the
 // selection — or above it when the selection sits near the bottom of the
 // screen — and kept clear of the viewport's side edges.
-const POPOVER_H = 32
-const POPOVER_HALF_W = 80
-function popoverPosition(rect: DOMRect): React.CSSProperties {
+const POPOVER_H = 34
+function popoverPosition(rect: DOMRect, halfWidth: number): React.CSSProperties {
   const below = rect.bottom + 6
   const top = below + POPOVER_H > window.innerHeight - 8 ? rect.top - 6 - POPOVER_H : below
   const vw = document.documentElement.clientWidth
-  const centre = Math.min(Math.max(rect.left + rect.width / 2, POPOVER_HALF_W + 8), vw - POPOVER_HALF_W - 8)
+  const centre = Math.min(Math.max(rect.left + rect.width / 2, halfWidth + 8), vw - halfWidth - 8)
   return { top: Math.max(8, top), left: centre, transform: 'translateX(-50%)' }
 }
+
+// ── Is a mouse button held? ───────────────────────────────────────────────────
+// One page-wide tracker (not one per turn). A mouse selection is read when the
+// button is released; selectionchange is the path for everything else — touch
+// long-press and its drag handles, and keyboard selection — and must stay quiet
+// while a mouse drag is still in progress.
+let mouseHeld = false
+if (typeof document !== 'undefined') {
+  document.addEventListener('pointerdown', (e) => { if (e.pointerType === 'mouse' && e.button === 0) mouseHeld = true }, true)
+  document.addEventListener('pointerup', () => { mouseHeld = false }, true)
+}
+
+/** How long a touch selection must sit still before the popover appears — long
+ *  enough to let the reader finish dragging the selection handles. */
+const SETTLE_MS = 400
 
 // ── Speaker label ─────────────────────────────────────────────────────────────
 // The label is the reader's scanning anchor, so it stays sans-serif and clearly
@@ -45,15 +72,25 @@ const ROLE_LABEL: Record<string, string> = {
 // context header — the same person must read identically in both places.
 
 // ── Component ─────────────────────────────────────────────────────────────────
-export default function SpeakerTurn({ turn, index, startsSection = false }: {
+export default function SpeakerTurn({ turn, index, startsSection = false, highlight, receipt }: {
   turn: Turn
   index: number
   /** A section header sits directly above — it already provides the separation. */
   startsSection?: boolean
+  /** A shared quote's located passage in this turn (char range into the text). */
+  highlight?: { start: number; end: number }
+  /** The shared quote's receipt bar, shown above the text of the quote's first turn. */
+  receipt?: ReactNode
 }) {
   const user         = useAuthStore(s => s.user)
   const paragraphRef = useRef<HTMLParagraphElement>(null)
+  const popoverRef   = useRef<HTMLDivElement>(null)
+  // When the popover was last pressed. On touch, tapping a button can clear the
+  // text selection BEFORE the tap's click fires; without this, the collapse
+  // would dismiss the popover out from under the reader's finger.
+  const pressedAt    = useRef(0)
   const [quoteState, setQuoteState] = useState<QuoteState>({ phase: 'idle' })
+  const [share, setShare] = useState<ShareState>({ kind: 'idle' })
 
   // Fall back through: attributed member → witness/non-member name → Deepgram's
   // raw diarization label ("Speaker 2") → last-resort. Without speaker_label_raw
@@ -68,19 +105,22 @@ export default function SpeakerTurn({ turn, index, startsSection = false }: {
   const partyState  = partyStateLabel(turn.party, turn.state)
   const roleLabel   = turn.speaker_role ? ROLE_LABEL[turn.speaker_role] ?? '' : ''
   const text        = turn.clean_text ?? turn.raw_text
+  const originNote  = turnOriginNote(turn.text_origin, !!turn.word_times?.length)
+  // A highlight is only trusted if it fits the text this page actually has.
+  const mark        = highlight && highlight.start < highlight.end && highlight.end <= text.length ? highlight : null
 
   // ── Quote selection ─────────────────────────────────────────────────────────
   // The paragraph's selected part, kept so the popover can follow it on scroll.
   const quoteRangeRef = useRef<Range | null>(null)
 
   // Read the current selection as a quote of THIS turn: char offsets into
-  // `text` (the paragraph's textContent === clean_text ?? raw_text). A selection
-  // that spills past the paragraph — dragged up into the speaker label, or on
-  // into the next turn — is clipped to it rather than rejected, and surrounding
-  // whitespace is trimmed off the span, so the stored offsets are exactly the
-  // quoted words.
+  // `text` (the paragraph's textContent === clean_text ?? raw_text, even with
+  // a <mark> inside it). A selection that spills past the paragraph — dragged
+  // up into the speaker label, or on into the next turn — is clipped to it
+  // rather than rejected (a quote is one speaker's words), and surrounding
+  // whitespace is trimmed off the span, so the offsets are exactly the words.
   function captureSelection() {
-    if (!user) return
+    if (share.kind === 'busy') return           // a link is being made from the current capture
     const sel = window.getSelection()
     const container = paragraphRef.current
     if (!sel || sel.isCollapsed || !sel.rangeCount || !container) return
@@ -109,6 +149,7 @@ export default function SpeakerTurn({ turn, index, startsSection = false }: {
     if (!endsInside)   clipped.setEnd(whole.endContainer, whole.endOffset)
     quoteRangeRef.current = clipped
 
+    setShare({ kind: 'idle' })
     setQuoteState({
       phase: 'popover',
       charStart,
@@ -117,29 +158,58 @@ export default function SpeakerTurn({ turn, index, startsSection = false }: {
       anchorRect: clipped.getBoundingClientRect(),
     })
   }
+  // The listeners below outlive a render; they always call the latest version.
+  const captureRef = useRef(captureSelection)
+  captureRef.current = captureSelection
 
-  // A drag that starts in the paragraph often ENDS outside it — the measure is
-  // capped at 70ch, so pulling to the end of a line releases over the margin.
-  // Listening for mouseup on the paragraph missed exactly those selections, so
-  // arm a one-shot document-level listener on press instead.
+  // Mouse: a drag that starts in the paragraph often ENDS outside it — the
+  // measure is capped at 70ch, so pulling to the end of a line releases over
+  // the margin. Arm a one-shot document-level listener on press.
   function handlePointerDown(e: React.PointerEvent) {
-    if (!user || e.button !== 0) return
+    if (e.pointerType !== 'mouse' || e.button !== 0) return
     const onUp = () => {
       document.removeEventListener('pointerup', onUp)
       // After the browser has finalised the selection for this release.
-      requestAnimationFrame(captureSelection)
+      requestAnimationFrame(() => captureRef.current())
     }
     document.addEventListener('pointerup', onUp)
   }
 
-  // While the popover is up: dismiss it when the selection is cleared, and keep
-  // it pinned to the selection as the page scrolls (it is position: fixed, so
-  // its coordinates are viewport-relative and go stale on scroll).
+  // Touch (long-press, then dragging the selection handles) and keyboard: no
+  // pointerup marks "done", so wait for the selection to settle. Only the turn
+  // where the selection STARTED responds, so a selection across turns yields
+  // one popover, not several.
+  useEffect(() => {
+    let timer = 0
+    const onChange = () => {
+      if (mouseHeld) return
+      const sel = window.getSelection()
+      const p = paragraphRef.current
+      if (!sel || sel.isCollapsed || !p || !sel.anchorNode || !p.contains(sel.anchorNode)) return
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => captureRef.current(), SETTLE_MS)
+    }
+    document.addEventListener('selectionchange', onChange)
+    return () => {
+      window.clearTimeout(timer)
+      document.removeEventListener('selectionchange', onChange)
+    }
+  }, [])
+
+  // While the popover is up: keep it pinned to the selection as the page
+  // scrolls (it is position: fixed, so its coordinates go stale on scroll), and
+  // dismiss it — when the selection is cleared if no share has started, else
+  // on a tap/click outside it.
+  const shareStarted = share.kind !== 'idle'
   useEffect(() => {
     if (quoteState.phase !== 'popover') return
     const onSelection = () => {
+      if (shareStarted || Date.now() - pressedAt.current < 800) return
       const sel = window.getSelection()
       if (!sel || sel.isCollapsed) setQuoteState({ phase: 'idle' })
+    }
+    const onOutside = (e: PointerEvent) => {
+      if (shareStarted && !popoverRef.current?.contains(e.target as Node)) setQuoteState({ phase: 'idle' })
     }
     let frame = 0
     const onScroll = () => {
@@ -150,21 +220,54 @@ export default function SpeakerTurn({ turn, index, startsSection = false }: {
       })
     }
     document.addEventListener('selectionchange', onSelection)
+    document.addEventListener('pointerdown', onOutside)
     window.addEventListener('scroll', onScroll, true)
     window.addEventListener('resize', onScroll)
     return () => {
       cancelAnimationFrame(frame)
       document.removeEventListener('selectionchange', onSelection)
+      document.removeEventListener('pointerdown', onOutside)
       window.removeEventListener('scroll', onScroll, true)
       window.removeEventListener('resize', onScroll)
     }
-  }, [quoteState.phase])
+  }, [quoteState.phase, shareStarted])
+
+  // "✓ Link copied" lingers briefly, then the popover and selection clear.
+  useEffect(() => {
+    if (share.kind !== 'copied') return
+    const t = setTimeout(() => {
+      window.getSelection()?.removeAllRanges()
+      setQuoteState({ phase: 'idle' })
+      setShare({ kind: 'idle' })
+    }, 1600)
+    return () => clearTimeout(t)
+  }, [share.kind])
 
   function openQuoteForm() {
     if (quoteState.phase !== 'popover') return
     window.getSelection()?.removeAllRanges()
     setQuoteState({ phase: 'form', charStart: quoteState.charStart, charEnd: quoteState.charEnd, text: quoteState.text })
   }
+
+  // Create the citation and copy its link. The clipboard write has to START
+  // inside this click (Safari), so copyPending is called before any await and
+  // is handed the link as a promise.
+  function copyQuoteLink() {
+    if (quoteState.phase !== 'popover' || share.kind === 'busy') return
+    setShare({ kind: 'busy' })
+    const link = createCitation({
+      turn_id: turn.id,
+      char_start: quoteState.charStart,
+      char_end: quoteState.charEnd,
+      expected_text: quoteState.text,
+    }).then((c) => citationUrl(c.code))
+    copyPending(link).then(
+      (r) => setShare(r.copied ? { kind: 'copied' } : { kind: 'manual', url: r.text }),
+      (e: Error) => setShare({ kind: 'error', message: e.message }),
+    )
+  }
+
+  const closePopover = () => { setQuoteState({ phase: 'idle' }); setShare({ kind: 'idle' }) }
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -207,6 +310,13 @@ export default function SpeakerTurn({ turn, index, startsSection = false }: {
         )}
       </div>
 
+      {/* Not from the audio: say so, quietly but on every such turn. */}
+      {originNote && (
+        <p className="-mt-1 mb-2 text-[11px] italic text-slate-500">
+          <span aria-hidden className="not-italic">✎ </span>{originNote}
+        </p>
+      )}
+
       {turn.topics?.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-1.5">
           {turn.topics.map(t => (
@@ -221,21 +331,33 @@ export default function SpeakerTurn({ turn, index, startsSection = false }: {
         </div>
       )}
 
-      {/* The testimony as plain prose — one text node, so textContent ===
-          clean_text ?? raw_text and a selection's char offsets (quotes) index
-          straight into the canonical text. Word timing is NOT rendered; it stays
-          in turn.word_times, and utils/tokenizeTurn maps text positions onto it
-          (edit-aware) whenever a feature needs a word's time.
+      {receipt}
+
+      {/* The testimony as plain prose — textContent === clean_text ?? raw_text
+          character for character (a shared quote's <mark> only wraps a slice of
+          it), so a selection's char offsets index straight into the canonical
+          text. Word timing is NOT rendered; it stays in turn.word_times.
           Serif, ~1.75 leading, measure capped near 70ch: the reading layer. */}
       <p
         ref={paragraphRef}
         onPointerDown={handlePointerDown}
         className="max-w-[70ch] cursor-text select-text font-serif text-[17px] leading-[1.75] text-slate-800"
       >
-        {text}
+        {mark ? (
+          <>
+            {text.slice(0, mark.start)}
+            <mark
+              data-cite-mark
+              className="scroll-mt-32 rounded-sm bg-amber-200/70 px-0.5 -mx-0.5 text-slate-900 box-decoration-clone"
+            >
+              {text.slice(mark.start, mark.end)}
+            </mark>
+            {text.slice(mark.end)}
+          </>
+        ) : text}
       </p>
 
-      {/* Quote form (inline, replaces popover after "Quote & Comment" click) */}
+      {/* Quote form (inline, replaces popover after "Comment" click) */}
       {quoteState.phase === 'form' && (
         <div className="mt-3">
           <CommentForm
@@ -264,25 +386,62 @@ export default function SpeakerTurn({ turn, index, startsSection = false }: {
         defaultCollapsed
       />
 
-      {/* Quote & Comment popover — fixed, portalled to avoid overflow clipping.
+      {/* Selection popover — fixed, portalled to avoid overflow clipping.
           getBoundingClientRect() is ALREADY viewport-relative, which is what
-          position: fixed wants — adding window.scrollY (as this used to) pushed
-          the popover off the bottom of the screen on any turn more than a
-          viewport down the page, i.e. effectively all testimony. */}
-      {/* TODO: mobile quote-selection (long-press selection handles fire no pointerup) */}
+          position: fixed wants. "Copy link" is for everyone (sharing a quote
+          needs no account); "Comment" needs one. */}
       {quoteState.phase === 'popover' && createPortal(
         <div
-          className="fixed z-50 flex items-center gap-1.5 bg-slate-800 text-white text-xs px-3 py-1.5 rounded-lg shadow-lg pointer-events-auto"
-          style={popoverPosition(quoteState.anchorRect)}
+          ref={popoverRef}
+          role="toolbar"
+          aria-label="Quote actions"
+          className="fixed z-50 flex items-center gap-1 rounded-lg bg-slate-800 px-1.5 py-1 text-xs text-white shadow-lg"
+          style={popoverPosition(quoteState.anchorRect, share.kind === 'manual' ? 150 : share.kind === 'error' ? 140 : 90)}
+          onPointerDown={() => { pressedAt.current = Date.now() }}
+          // Keep the text selected while pressing a button (desktop).
+          onMouseDown={e => { if (!(e.target instanceof HTMLInputElement)) e.preventDefault() }}
         >
-          <span>💬</span>
-          <button
-            onMouseDown={e => e.preventDefault()}  // prevent selection loss before click
-            onClick={openQuoteForm}
-            className="font-medium hover:text-amber-300 transition-colors"
-          >
-            Quote &amp; Comment
-          </button>
+          {share.kind === 'copied' ? (
+            <span className="px-2 py-1 font-medium text-green-300" role="status">✓ Link copied</span>
+          ) : share.kind === 'manual' ? (
+            <>
+              <input
+                readOnly
+                value={share.url}
+                aria-label="Quote link — copy it"
+                onFocus={e => e.currentTarget.select()}
+                autoFocus
+                className="w-56 rounded bg-slate-700 px-2 py-1 text-xs text-white outline-none ring-1 ring-slate-500"
+              />
+              <button onClick={closePopover} aria-label="Close" className="px-1.5 py-1 text-slate-300 hover:text-white">×</button>
+            </>
+          ) : share.kind === 'error' ? (
+            <>
+              <span className="max-w-[16rem] px-2 py-1 text-amber-200" role="alert">{share.message}</span>
+              <button onClick={closePopover} aria-label="Close" className="px-1.5 py-1 text-slate-300 hover:text-white">×</button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={copyQuoteLink}
+                disabled={share.kind === 'busy'}
+                className="rounded px-2 py-1 font-medium transition-colors hover:bg-slate-700 hover:text-amber-300 disabled:opacity-70"
+              >
+                <span aria-hidden>🔗</span> {share.kind === 'busy' ? 'Creating link…' : 'Copy link'}
+              </button>
+              {user && (
+                <>
+                  <span aria-hidden className="h-4 w-px bg-slate-600" />
+                  <button
+                    onClick={openQuoteForm}
+                    className="rounded px-2 py-1 font-medium transition-colors hover:bg-slate-700 hover:text-amber-300"
+                  >
+                    <span aria-hidden>💬</span> Comment
+                  </button>
+                </>
+              )}
+            </>
+          )}
         </div>,
         document.body
       )}

@@ -1,5 +1,6 @@
 const db = require('../utils/db');
 const { industryLabel } = require('../utils/witnessIndustries');
+const { publicTranscript, PUBLIC_TURN_FILTER } = require('../utils/publicTranscript');
 
 async function listHearings(req, res) {
   try {
@@ -113,21 +114,15 @@ async function getHearingTranscript(req, res) {
     if (!hearingRows.length) return res.status(404).json({ error: 'Hearing not found' });
     const hearing = hearingRows[0];
 
-    const { rows: txRows } = await db.query(`
-      SELECT * FROM transcripts
-      WHERE hearing_id = $1
-      ORDER BY is_primary DESC, created_at DESC
-      LIMIT 1
-    `, [req.params.id]);
+    // The same transcript citations snapshot from and resolve against.
+    const transcript = await publicTranscript(db, req.params.id);
 
-    if (!txRows.length) {
+    if (!transcript) {
       // Same shape either way, so the reader page never has to branch on it.
       return res.json({
         data: { hearing, transcript: null, context: { participants: [], witnesses: [], topics: [] } },
       });
     }
-
-    const transcript = txRows[0];
 
     // speaker_ordinal is the derived "Speaker N" (appearance order of editable
     // speaker buckets) — the display fallback for unattributed speakers, kept
@@ -139,7 +134,7 @@ async function getHearingTranscript(req, res) {
         f.speaker_ordinal,
         st.speaker_name, st.speaker_role,
         st.start_ms, st.end_ms, st.attribution_status,
-        st.raw_text, st.clean_text, st.word_times, st.is_edited,
+        st.raw_text, st.clean_text, st.word_times, st.is_edited, st.text_origin,
         m.full_name AS member_full_name, m.bioguide_id,
         m.party, m.state, m.chamber,
         COALESCE(
@@ -155,7 +150,7 @@ async function getHearingTranscript(req, res) {
               FROM speaker_turns WHERE transcript_id = $1
              GROUP BY speaker_key) f ON f.speaker_key = st.speaker_key
       LEFT JOIN members m ON m.id = st.member_id
-      WHERE st.transcript_id = $1 AND st.raw_text <> ''
+      WHERE st.transcript_id = $1 AND ${PUBLIC_TURN_FILTER}
       ORDER BY st.seq
     `, [transcript.id]);
 
@@ -185,7 +180,7 @@ async function getHearingTranscript(req, res) {
     // from the attributed turns, not stored: participants are the roster
     // members who actually spoke (NOT the committee roster), witnesses are the
     // named non-members, topics are the union of the per-turn tags. Each
-    // excludes blank admin-inserted turns exactly as the turn query does, so
+    // excludes unfilled inserted turns exactly as the turn query does, so
     // the counts always describe what a reader can actually read.
     const { rows: participants } = await db.query(`
       SELECT m.id, m.full_name, m.party, m.state, m.chamber,
@@ -205,7 +200,7 @@ async function getHearingTranscript(req, res) {
            ORDER BY (cm.congress = $3) DESC NULLS LAST, cm.congress DESC NULLS LAST
            LIMIT 1
         ) r ON true
-       WHERE st.transcript_id = $1 AND st.raw_text <> ''
+       WHERE st.transcript_id = $1 AND ${PUBLIC_TURN_FILTER}
        GROUP BY m.id, r.role
        ORDER BY CASE r.role WHEN 'chair' THEN 0 WHEN 'ranking_member' THEN 1 ELSE 2 END,
                 min(st.seq)
@@ -226,7 +221,7 @@ async function getHearingTranscript(req, res) {
                count(*)::int    AS turn_count,
                min(st.seq)::int AS first_seq
           FROM speaker_turns st
-         WHERE st.transcript_id = $1 AND st.raw_text <> ''
+         WHERE st.transcript_id = $1 AND ${PUBLIC_TURN_FILTER}
            AND st.member_id IS NULL
            AND COALESCE(btrim(st.speaker_name), '') <> ''
            -- Committee staff are in the room but are not witnesses.
@@ -270,7 +265,7 @@ async function getHearingTranscript(req, res) {
         FROM turn_topics tt
         JOIN topics t ON t.id = tt.topic_id
         JOIN speaker_turns st ON st.id = tt.turn_id
-       WHERE st.transcript_id = $1 AND st.raw_text <> ''
+       WHERE st.transcript_id = $1 AND ${PUBLIC_TURN_FILTER}
        GROUP BY t.id, t.slug, t.name
        ORDER BY count(DISTINCT st.id) DESC, t.name
     `, [transcript.id]);

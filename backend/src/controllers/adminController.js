@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const db = require('../utils/db');
-const { splitAtWord, splitAtChar, mergeTexts, meanConfidence } = require('../utils/turnText');
+const { splitAtWord, splitAtChar, meanConfidence } = require('../utils/turnText');
+const { planMerge, firstFillPlan, displayableSql } = require('../utils/turnContent');
 const { classifyEdit, applyEdits, isBulkAcceptable, anchorEdit, normalizeSpanWhitespace, spanLimits } = require('../utils/cleanupValidate');
 const { composeEdits } = require('../utils/textDiff');
 const { detectSections, loadSectionTurns, writeSections, turnsFingerprint, assertTiling } = require('../utils/sectionDetect');
@@ -625,8 +626,8 @@ async function splitTurn(req, res) {
       `INSERT INTO speaker_turns
          (transcript_id, seq, speaker_label_raw, speaker_key, start_ms, end_ms,
           confidence, attribution_status, raw_text, word_times, suggestions,
-          member_id, speaker_name, speaker_role)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14)
+          member_id, speaker_name, speaker_role, text_origin)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb, $12, $13, $14, $15)
        RETURNING id`,
       [
         transcriptId, orig.seq + 1, orig.speaker_label_raw, bKey,
@@ -634,6 +635,9 @@ async function splitTurn(req, res) {
         meanConfidence(wtB) ?? (wtB ? null : orig.confidence),
         bStatus, textB, wtB ? JSON.stringify(wtB) : null, JSON.stringify(bSuggestions),
         bIdentity.member_id, bIdentity.speaker_name, bIdentity.speaker_role,
+        // Both halves carry the turn's origin: a split moves words, it doesn't
+        // change who transcribed them.
+        orig.text_origin,
       ]
     );
     const newId = bRows[0].id;
@@ -719,22 +723,22 @@ async function mergeTurn(req, res) {
         : (target.suggestions?.structural?.op === 'split' && target.suggestions.structural.sibling === victim.id)
           ? target.suggestions.structural.joiner
           : ' ';
-    const { merged, joinerUsed, seamOffset } = mergeTexts(first.raw_text, second.raw_text, sibJoiner);
-
-    // word_times: concat in reading order. An empty-text side contributes
-    // nothing; a non-empty side with missing word_times poisons the merge
-    // (timing can no longer be trusted) → NULL + warning, text untouched.
-    let mergedWt, wtLost = false;
-    const firstWt  = first.raw_text.length  ? first.word_times  : [];
-    const secondWt = second.raw_text.length ? second.word_times : [];
-    if (firstWt === null || secondWt === null) {
-      mergedWt = null;
-      wtLost = (first.raw_text.length && Array.isArray(first.word_times)) ||
-               (second.raw_text.length && Array.isArray(second.word_times));
-    } else {
-      mergedWt = [...firstWt, ...secondWt];
-      if (!mergedWt.length) mergedWt = null;
+    // The whole merge, computed and CHECKED before anything is written (see
+    // turnContent.planMerge): every word either turn displays is in its
+    // raw_text and survives into the merged record — refused otherwise, never
+    // silently dropped. word_times concatenate in reading order (a side with
+    // words but no timing — e.g. a reviewer-transcribed turn — leaves the merge
+    // untimed, surfaced as word_times_lost); origin becomes 'mixed' when an
+    // ASR turn and a reviewer's turn combine.
+    let plan;
+    try {
+      plan = planMerge(first, second, sibJoiner);
+    } catch (e) {
+      await client.query('ROLLBACK');
+      if (e.status) return res.status(e.status).json({ error: e.message });
+      throw e;
     }
+    const { merged, seamOffset, wordTimes: mergedWt, wtLost, textOrigin } = plan;
 
     const structural = {
       op: 'merge',
@@ -754,7 +758,7 @@ async function mergeTurn(req, res) {
 
     await client.query(
       `UPDATE speaker_turns
-          SET raw_text = $2, word_times = $3::jsonb, clean_text = NULL,
+          SET raw_text = $2, word_times = $3::jsonb, clean_text = NULL, text_origin = $8,
               start_ms = $4, end_ms = $5, confidence = $6, attribution_status = 'edited',
               suggestions = jsonb_set(coalesce(suggestions, '{}'::jsonb) - 'cleanup' - 'text_edits', '{structural}', $7::jsonb, true)
         WHERE id = $1`,
@@ -763,6 +767,7 @@ async function mergeTurn(req, res) {
         first.start_ms ?? second.start_ms, second.end_ms ?? first.end_ms,
         meanConfidence(mergedWt) ?? target.confidence,
         JSON.stringify(structural),
+        textOrigin,
       ]
     );
     // A section may be anchored on the turn we are about to delete. Its words
@@ -833,8 +838,8 @@ async function insertTurn(req, res) {
 
     const { rows: nRows } = await client.query(
       `INSERT INTO speaker_turns
-         (transcript_id, seq, speaker_key, attribution_status, raw_text, suggestions)
-       VALUES ($1, $2, $3, 'unverified', '', $4::jsonb)
+         (transcript_id, seq, speaker_key, attribution_status, raw_text, text_origin, suggestions)
+       VALUES ($1, $2, $3, 'unverified', '', 'human', $4::jsonb)
        RETURNING id`,
       [transcriptId, newSeq, newSpeakerKey(),
        JSON.stringify({ structural: { op: 'insert', at: new Date().toISOString() } })]
@@ -1497,8 +1502,15 @@ async function overrideCleanup(req, res) {
 //  Manual inline edit. The client sends the FULL new turn text; the server
 //  diffs it against raw_text to derive human edit spans (each recording its raw
 //  original), asserts they reconstruct the submitted text exactly, and
-//  recomputes clean_text. raw_text is never touched. Human edits are trusted
-//  (they may legitimately change a word) but always transparent and reversible.
+//  recomputes clean_text. Human edits are trusted (they may legitimately change
+//  a word) but always transparent and reversible.
+//
+//  FIRST FILL — the one case that writes raw_text. An inserted turn has
+//  raw_text '' and no original for an edit to be an edit OF: the first words a
+//  reviewer saves ARE its first transcription (origin 'human', migration 015).
+//  Storing them as an insertion edit over '' instead left clean_text holding
+//  the only copy, which every raw_text-based path (the public page, citations,
+//  merge) treated as absent. Once filled, the turn is edited like any other.
 async function editTurnText(req, res) {
   const { text, base } = req.body || {};
   if (typeof text !== 'string') return res.status(400).json({ error: 'text (string) is required' });
@@ -1509,6 +1521,35 @@ async function editTurnText(req, res) {
     if (!transcriptId) return res.status(404).json({ error: 'No deepgram_batch transcript for this hearing' });
     const turn = await loadTurn(client, transcriptId, req.params.turnId);
     if (!turn) return res.status(404).json({ error: 'Turn not found in this hearing' });
+
+    let fill;
+    try {
+      fill = firstFillPlan(turn, text);
+    } catch (e) {
+      return res.status(e.status).json({ error: e.message });
+    }
+    if (fill) {
+      const sugg = { ...(turn.suggestions || {}) };
+      delete sugg.text_edits;
+      delete sugg.cleanup;
+      sugg.text_review = { reviewed_at: new Date().toISOString(), by: req.user?.id ?? null };
+      await client.query('BEGIN');
+      // Guarded on raw_text = '' so two racing first saves can't both "fill".
+      const { rowCount } = await client.query(
+        `UPDATE speaker_turns
+            SET raw_text = $2, clean_text = NULL, text_origin = 'human', is_edited = false,
+                edited_by = $3, suggestions = $4::jsonb, updated_at = now()
+          WHERE id = $1 AND raw_text = ''`,
+        [turn.id, fill.raw_text, req.user?.id ?? null, JSON.stringify(sugg)]
+      );
+      if (!rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'This turn was filled in meanwhile. Reopen the editor to pick up its text.' });
+      }
+      const demoted = await maybeDemote(client, req.params.id);
+      await client.query('COMMIT');
+      return res.json({ data: { demoted, edits: 0, first_fill: true } });
+    }
 
     const existing = Array.isArray(turn.suggestions?.text_edits) ? turn.suggestions.text_edits : [];
 
@@ -1624,7 +1665,7 @@ async function setStatus(req, res) {
       const { rows: textPending } = await client.query(
         `SELECT 'Turn ' || seq AS label
            FROM speaker_turns
-          WHERE transcript_id = $1 AND raw_text <> ''
+          WHERE transcript_id = $1 AND ${displayableSql('')}
             AND ( NOT (suggestions ? 'text_review')
                OR EXISTS (SELECT 1 FROM jsonb_array_elements(coalesce(suggestions->'cleanup'->'edits', '[]'::jsonb)) e
                            WHERE e->>'status' = 'proposed') )

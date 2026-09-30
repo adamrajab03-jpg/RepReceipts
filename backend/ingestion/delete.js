@@ -9,6 +9,11 @@
 //  speaker_turns.transcript_id, so deleting the hearings row is sufficient —
 //  no manual FK-ordered deletes needed.
 //
+//  CITATIONS ARE THE EXCEPTION. citations.hearing_id is ON DELETE RESTRICT
+//  (migration 014): a shared quote is a public receipt, so deleting a hearing
+//  that has any refuses unless --with-citations is passed, which deletes them
+//  first — and breaks every one of those links. Never implicit.
+//
 //  Does NOT touch backend/ingestion/artifacts/ — that cache is content-
 //  addressed (keyed by audio hash, not hearing id), so re-ingesting the same
 //  audio after this delete is still a free, instant cache hit.
@@ -20,9 +25,11 @@ const { Pool } = require('pg');
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 async function main() {
-  const hearingId = process.argv[2];
+  const args = process.argv.slice(2);
+  const withCitations = args.includes('--with-citations');
+  const hearingId = args.find((a) => !a.startsWith('--'));
   if (!hearingId || !UUID_RE.test(hearingId)) {
-    console.error('Usage: npm run ingest:delete -- <hearingId>');
+    console.error('Usage: npm run ingest:delete -- <hearingId> [--with-citations]');
     process.exit(1);
   }
 
@@ -45,10 +52,23 @@ async function main() {
          (SELECT count(*) FROM transcripts WHERE hearing_id = $1) AS transcripts,
          (SELECT count(*) FROM speaker_turns st
             JOIN transcripts t ON t.id = st.transcript_id
-            WHERE t.hearing_id = $1) AS turns`,
+            WHERE t.hearing_id = $1) AS turns,
+         (SELECT count(*) FROM citations WHERE hearing_id = $1) AS citations`,
       [hearingId]
     );
-    const { transcripts, turns } = countsRes.rows[0];
+    const { transcripts, turns, citations } = countsRes.rows[0];
+
+    if (Number(citations) > 0) {
+      if (!withCitations) {
+        console.error(`Refusing: ${citations} shared quote link(s) cite this hearing ("${title}").`);
+        console.error('Deleting it would break every one of those public links.');
+        console.error('Re-run with --with-citations to delete them along with the hearing.');
+        await client.query('ROLLBACK');
+        process.exitCode = 1;
+        return;
+      }
+      await client.query(`DELETE FROM citations WHERE hearing_id = $1`, [hearingId]);
+    }
 
     await client.query(`DELETE FROM hearings WHERE id = $1`, [hearingId]);
     await client.query('COMMIT');
@@ -56,6 +76,7 @@ async function main() {
     console.log(`Deleted hearing ${hearingId} ("${title}")`);
     console.log(`  transcripts   : ${transcripts}`);
     console.log(`  speaker_turns : ${turns}`);
+    if (Number(citations) > 0) console.log(`  citations     : ${citations} (quote links now dead)`);
     console.log('  Deepgram artifact cache left untouched — re-ingesting this audio is still free.');
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
