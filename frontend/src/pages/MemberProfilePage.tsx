@@ -1,4 +1,4 @@
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams, useLocation } from 'react-router-dom'
 import { useMember } from '../hooks/useMember'
 import { useMemberTopics } from '../hooks/useTopics'
 import ApprovalGrid from '../components/ApprovalGrid'
@@ -35,6 +35,14 @@ export default function MemberProfilePage() {
   const { data, isLoading, isError } = useMember(id!)
   const topicsQ = useMemberTopics(id!)
 
+  // Where "← Back" returns to. A link from a search result carries the search's
+  // own URL in navigation state, so the reader lands back on their results with
+  // query and filters intact; anywhere else falls back to the members list.
+  const nav = useLocation().state as { from?: string; backTo?: string } | null
+  const back = nav?.from === 'search' && nav.backTo
+    ? { to: nav.backTo, label: 'Back to search results' }
+    : { to: '/members', label: 'Back to Members' }
+
   if (isLoading) return <p className="text-sm text-gray-500">Loading…</p>
   if (isError || !data) return <p className="text-sm text-red-500">Member not found.</p>
 
@@ -42,8 +50,8 @@ export default function MemberProfilePage() {
 
   return (
     <div className="max-w-2xl">
-      <Link to="/members" className="text-sm text-gray-500 hover:text-gray-700 mb-4 inline-block">
-        ← Back to Members
+      <Link to={back.to} className="text-sm text-gray-500 hover:text-gray-700 mb-4 inline-block">
+        ← {back.label}
       </Link>
 
       <div className="bg-white rounded-lg border border-gray-200 p-6 mb-6">

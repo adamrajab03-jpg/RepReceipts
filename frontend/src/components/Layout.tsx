@@ -37,6 +37,16 @@ export default function Layout() {
           </NavLink>
 
           <NavLink
+            to="/search"
+            className={({ isActive }) =>
+              cn('text-sm font-medium transition-colors hover:text-white',
+                isActive ? 'text-white' : 'text-slate-400')
+            }
+          >
+            Search
+          </NavLink>
+
+          <NavLink
             to="/heatmap"
             className={({ isActive }) =>
               cn('text-sm font-medium transition-colors hover:text-white',

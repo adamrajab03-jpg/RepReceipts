@@ -162,7 +162,9 @@ async function getHearingTranscript(req, res) {
       SELECT hs.id, hs.type, hs.label, hs.member_id,
              st.seq AS start_seq,
              lead(st.seq) OVER (ORDER BY st.seq) AS next_seq,
-             m.full_name AS member_full_name
+             m.full_name AS member_full_name,
+             m.chamber   AS member_chamber,
+             m.party     AS member_party
         FROM hearing_sections hs
         JOIN speaker_turns st ON st.id = hs.start_turn_id
         LEFT JOIN members m ON m.id = hs.member_id
@@ -235,6 +237,7 @@ async function getHearingTranscript(req, res) {
          WHERE hearing_id = $2
       )
       SELECT COALESCE(w.display_name, s.name) AS name,
+             w.id                       AS witness_id,
              w.title,
              w.organization,
              w.industry,

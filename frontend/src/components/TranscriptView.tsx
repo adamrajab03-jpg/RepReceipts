@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react'
+import { useLocation } from 'react-router-dom'
 import type { CitationView, Transcript } from '../types/api'
 import SpeakerTurn from './SpeakerTurn'
 import TranscriptOutline, { TranscriptOutlineBar } from './TranscriptOutline'
@@ -77,6 +78,27 @@ export default function TranscriptView({ transcript, videoUrl, citation }: {
     return () => cancelAnimationFrame(frame)
   }, [citation, transcript.turns])
 
+  // Arriving from a search result (/hearings/:id#turn-N): the native hash scroll
+  // fires before the transcript has loaded, so it misses. Once the turns are in
+  // the DOM, scroll to the target and flash it — the search analogue of the
+  // citation scroll above. A citation, when present, owns the scroll instead.
+  const { hash } = useLocation()
+  const hashScrolledFor = useRef<string | null>(null)
+  useEffect(() => {
+    if (citation) return
+    if (!/^#turn-\d+$/.test(hash) || hashScrolledFor.current === hash) return
+    const frame = requestAnimationFrame(() => {
+      const el = document.getElementById(hash.slice(1))
+      if (!el) return
+      hashScrolledFor.current = hash
+      el.scrollIntoView({ block: 'center' })
+      const flash = ['ring-2', 'ring-amber-400', 'rounded-lg', 'bg-amber-50/50']
+      el.classList.add(...flash)
+      setTimeout(() => el.classList.remove(...flash), 2200)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [citation, hash, transcript.turns])
+
   // One player per page, so exactly one of the three placements renders it:
   // the sidebar (desktop), the sticky bar's mini-player (mobile), or — for a
   // hearing with no sections, hence no sidebar or bar — a card above the text.
@@ -152,6 +174,7 @@ export default function TranscriptView({ transcript, videoUrl, citation }: {
                 <SpeakerTurn
                   turn={turn}
                   index={i}
+                  videoUrl={videoUrl}
                   startsSection={!!slots?.length}
                   highlight={citeSegments.has(turn.id)
                     ? { start: citeSegments.get(turn.id)!.char_start, end: citeSegments.get(turn.id)!.char_end }

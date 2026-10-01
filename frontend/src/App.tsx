@@ -6,6 +6,7 @@ import RepsLookupPage from './pages/RepsLookupPage'
 import MembersPage from './pages/MembersPage'
 import MemberProfilePage from './pages/MemberProfilePage'
 import HearingsPage from './pages/HearingsPage'
+import SearchPage from './pages/SearchPage'
 import CitationPage from './pages/CitationPage'
 import HearingTranscriptPage from './pages/HearingTranscriptPage'
 import HeatMapPage from './pages/HeatMapPage'
@@ -35,6 +36,7 @@ export default function App() {
           <Route path="members/:id" element={<MemberProfilePage />} />
           <Route path="hearings"    element={<HearingsPage />} />
           <Route path="hearings/:id" element={<HearingTranscriptPage />} />
+          <Route path="search"      element={<SearchPage />} />
           <Route path="q/:code"     element={<CitationPage />} />
           <Route path="heatmap"     element={<HeatMapPage />} />
           <Route path="following"   element={<FollowingPage />} />

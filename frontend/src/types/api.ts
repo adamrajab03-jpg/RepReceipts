@@ -136,6 +136,10 @@ export interface PublicSection {
   label: string | null
   member_id: string | null
   member_full_name: string | null
+  /** The member's chamber, so a section header can read "Sen."/"Rep.". */
+  member_chamber: string | null
+  /** The member's party, so a questioning header can be tinted D/R/I. */
+  member_party: string | null
   start_seq: number
   end_seq: number
 }
@@ -182,6 +186,9 @@ export interface HearingParticipant {
 export interface HearingWitness {
   /** display_name when a record exists, else the raw transcript speaker_name. */
   name: string
+  /** hearing_witnesses.id when a record exists — the value the /search speaker
+   *  filter passes as `w:<id>`. Null for a detected-but-unrecorded witness. */
+  witness_id: string | null
   title: string | null
   organization: string | null
   industry: IndustrySlug | null
@@ -541,6 +548,52 @@ export interface AdminHearing {
 export interface ListResponse<T> {
   data: T[]
   count: number
+}
+
+// ── Search (cross-hearing full-text) ──────────────────────────────────────────
+export interface SearchResultSpeaker {
+  /** Null for a witness — fall back to the result's speaker_name. */
+  member_id: string | null
+  full_name: string | null
+  party: string | null
+  state: string | null
+  chamber: string | null
+}
+
+export interface SearchResult {
+  turn_id: string
+  seq: number
+  /** ts_headline fragment with matches wrapped in sentinel chars (utils/snippet),
+   *  or a plain leading slice when the query is filters-only. */
+  snippet: string
+  rank: number
+  hearing: {
+    id: string
+    title: string
+    held_on: string | null
+    status: string
+    committee_name: string | null
+  }
+  speaker: SearchResultSpeaker
+  speaker_name: string | null
+  speaker_role: string | null
+  attribution_status: string
+  /** Affiliation for a witness's speaker card (name is speaker_name). Null for a
+   *  member — use `speaker` instead — or a witness with no admin record yet. */
+  witness: { organization: string | null; industry_label: string | null } | null
+  /** /hearings/:id#turn-:seq — the transcript scrolls to and flashes this turn. */
+  jump_url: string
+}
+
+export interface SearchResponse {
+  data: SearchResult[]
+  total: number
+  /** Distinct hearings the matches span, for "N matches across M hearings". */
+  hearings: number
+  page: number
+  page_size: number
+  q: string
+  sort: 'relevance' | 'date'
 }
 
 export interface DetailResponse<T> {

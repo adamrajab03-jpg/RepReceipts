@@ -11,6 +11,8 @@ import { memberLabel, partyPillClass, partyStateLabel } from '../utils/memberDis
 import { createCitation, citationUrl } from '../hooks/useCitation'
 import { copyPending } from '../utils/clipboard'
 import { turnOriginNote } from '../utils/textOrigin'
+import { youtubeWatchAt } from '../utils/youtube'
+import { useHearingVideo } from './HearingVideo'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type QuoteState =
@@ -72,9 +74,11 @@ const ROLE_LABEL: Record<string, string> = {
 // context header — the same person must read identically in both places.
 
 // ── Component ─────────────────────────────────────────────────────────────────
-export default function SpeakerTurn({ turn, index, startsSection = false, highlight, receipt }: {
+export default function SpeakerTurn({ turn, index, videoUrl, startsSection = false, highlight, receipt }: {
   turn: Turn
   index: number
+  /** The hearing's video URL, so the turn's timestamp can seek the docked player. */
+  videoUrl?: string | null
   /** A section header sits directly above — it already provides the separation. */
   startsSection?: boolean
   /** A shared quote's located passage in this turn (char range into the text). */
@@ -108,6 +112,12 @@ export default function SpeakerTurn({ turn, index, startsSection = false, highli
   const originNote  = turnOriginNote(turn.text_origin, !!turn.word_times?.length)
   // A highlight is only trusted if it fits the text this page actually has.
   const mark        = highlight && highlight.start < highlight.end && highlight.end <= text.length ? highlight : null
+
+  // The timestamp is a video link: a plain click seeks the docked player to this
+  // turn's moment (same mechanism the section headers use); with no docked player
+  // the YouTube deep link opens in a tab instead.
+  const { canSeek, seekClick } = useHearingVideo()
+  const watchHref   = turn.start_ms != null ? youtubeWatchAt(videoUrl, turn.start_ms) : null
 
   // ── Quote selection ─────────────────────────────────────────────────────────
   // The paragraph's selected part, kept so the popover can follow it on scroll.
@@ -304,9 +314,25 @@ export default function SpeakerTurn({ turn, index, startsSection = false, highli
         )}
 
         {turn.start_ms != null && (
-          <span className="ml-auto text-xs tabular-nums text-slate-500">
-            {formatTimecode(turn.start_ms)}
-          </span>
+          watchHref ? (
+            <a
+              href={watchHref}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={seekClick(turn.start_ms)}
+              title={canSeek
+                ? `Play from ${formatTimecode(turn.start_ms)}`
+                : `Watch on video (opens at ${formatTimecode(turn.start_ms)})`}
+              className="ml-auto inline-flex items-baseline gap-1 rounded px-1.5 py-0.5 text-xs font-medium tabular-nums text-slate-500 transition-colors hover:bg-blue-50 hover:text-blue-700"
+            >
+              <span aria-hidden className="text-[9px]">▶</span>
+              <span className="underline underline-offset-2">{formatTimecode(turn.start_ms)}</span>
+            </a>
+          ) : (
+            <span className="ml-auto text-xs tabular-nums text-slate-500">
+              {formatTimecode(turn.start_ms)}
+            </span>
+          )
         )}
       </div>
 
